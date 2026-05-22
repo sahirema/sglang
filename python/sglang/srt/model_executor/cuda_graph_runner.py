@@ -106,6 +106,60 @@ if TYPE_CHECKING:
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
 
+def _prewarm_aiter_fp8_padded_scratch(
+    model: torch.nn.Module,
+    capture_bs: List[int],
+    num_tokens_per_bs: int,
+) -> None:
+    """Prewarm the AIter FP8 padded-activation scratch cache.
+
+    Allocates a ``(M, padded_k)`` scratch tensor for every weight in
+    ``model`` whose ``aiter_padded_k`` exceeds ``aiter_original_k``, across
+    every ``M = bs * num_tokens_per_bs`` value in ``capture_bs``. Without
+    this, the first CUDA-graph capture would hit ``torch.empty`` inside the
+    graph context and either fail or leak an allocation into the captured
+    graph.
+
+    This function is idempotent: subsequent calls return immediately for any
+    ``(device, dtype, M, padded_k)`` already cached.
+    """
+    if not _is_hip:
+        return
+    try:
+        from sglang.srt.layers.quantization.fp8_utils import (
+            _AITER_FP8_ACTIVATION_PAD_SCRATCH,
+            _get_or_alloc_padded_activation_scratch,
+        )
+    except ImportError:
+        return
+
+    seen: set = set()
+    for module in model.modules():
+        weight = getattr(module, "weight", None)
+        if weight is None:
+            continue
+        padded_k = getattr(weight, "aiter_padded_k", None)
+        original_k = getattr(weight, "aiter_original_k", None)
+        if padded_k is None or original_k is None or padded_k == original_k:
+            continue
+        device = weight.device
+        # ``q_input`` at apply_fp8_ptpc_linear time is the FP8 output of
+        # ``per_token_quant_hip``; its dtype matches the weight dtype on
+        # ROCm (both torch.float8_e4m3fn on gfx950, both
+        # torch.float8_e4m3fnuz on gfx942).
+        for bs in capture_bs:
+            m = bs * num_tokens_per_bs
+            key = (device, weight.dtype, m, padded_k)
+            if key in _AITER_FP8_ACTIVATION_PAD_SCRATCH or key in seen:
+                continue
+            seen.add(key)
+            probe = torch.empty(
+                (m, original_k), dtype=weight.dtype, device=device
+            )
+            _get_or_alloc_padded_activation_scratch(probe, padded_k)
+            del probe
+
+
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
     """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
 
@@ -838,6 +892,14 @@ class CudaGraphRunner:
                     key = bs if stream_idx is None else f"{stream_idx}_{bs}"
                     self.graphs[key] = graph
                     self.output_buffers[key] = output_buffers
+
+        # GLM-4.6V FP8 padding: preallocate padded-activation scratch buffers
+        # for every (M, padded_k) we will see during graph capture. Must run
+        # before any ``graph_capture()`` context so the allocations land in
+        # the regular allocator pool rather than inside a captured graph.
+        _prewarm_aiter_fp8_padded_scratch(
+            self.model_runner.model, self.capture_bs, self.num_tokens_per_bs
+        )
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes

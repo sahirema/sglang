@@ -98,6 +98,37 @@ if _use_aiter:
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
+# GLM-4.6V FP8 padding: process-global scratch cache for padded activations.
+# Keyed by (device, dtype, M, padded_k) so layers that share an (M, padded_k)
+# share one scratch buffer. Allocated outside CUDA graph capture (see
+# ``_prewarm_aiter_fp8_padded_scratch`` in cuda_graph_runner.py) so the
+# capture itself never hits torch.empty inside the graph context.
+_AITER_FP8_ACTIVATION_PAD_SCRATCH: dict[tuple, "torch.Tensor"] = {}
+
+
+def _get_or_alloc_padded_activation_scratch(
+    q_input: torch.Tensor, padded_k: int
+) -> torch.Tensor:
+    """Return a ``(M, padded_k)`` scratch buffer suitable for padded
+    bpreshuffle GEMM input. The tail (``[:, original_k:]``) is zeroed at
+    allocation and never overwritten, so subsequent forwards only need to
+    copy the head into ``[:, :original_k]``.
+
+    Idempotent: subsequent calls with the same key return the existing
+    tensor.
+    """
+    key = (q_input.device, q_input.dtype, q_input.shape[0], padded_k)
+    scratch = _AITER_FP8_ACTIVATION_PAD_SCRATCH.get(key)
+    if scratch is None:
+        scratch = torch.empty(
+            (q_input.shape[0], padded_k),
+            dtype=q_input.dtype,
+            device=q_input.device,
+        )
+        scratch.zero_()
+        _AITER_FP8_ACTIVATION_PAD_SCRATCH[key] = scratch
+    return scratch
+
 
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
@@ -1671,15 +1702,45 @@ def apply_fp8_ptpc_linear(
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
 ) -> torch.Tensor:
-    """FP8 per-token per-channel linear. Only used with the aiter (ROCm) backend."""
+    """FP8 per-token per-channel linear. Only used with the aiter (ROCm) backend.
+
+    GLM-4.6V FP8 padding integration:
+    - When ``weight`` carries ``aiter_padded_k`` metadata greater than its
+      ``aiter_original_k``, we pad ``q_input`` to ``padded_k`` using a
+      graph-safe scratch buffer (see ``_get_or_alloc_padded_activation_scratch``).
+    - When ``aiter_is_shuffled`` is False (tuning-fallback path), we dispatch
+      to ``aiter.gemm_a8w8_CK`` (no preshuffle) at the original K instead of
+      ``aiter.gemm_a8w8_bpreshuffle``.
+    Padding metadata travels on the weight tensor's attributes, so callers
+    do not need to pass any new arguments.
+    """
+    # Pull GLM padding metadata up front so both the tuple-input and the
+    # standard input paths can use it consistently.
+    weight_original_k = getattr(weight, "aiter_original_k", weight.shape[-1])
+    weight_padded_k = getattr(weight, "aiter_padded_k", weight.shape[-1])
+    weight_is_shuffled = getattr(weight, "aiter_is_shuffled", True)
+
     # Handle pre-quantized (fp8_tensor, scale) tuple from fused RMSNorm+Quant
     if isinstance(input, tuple):
         q_input, x_scale = input
         q_input = q_input.view(-1, q_input.shape[-1])
         output_shape = [*q_input.shape[:-1], weight.shape[0]]
-        output = aiter.gemm_a8w8_bpreshuffle(
-            q_input, weight, x_scale, weight_scale, None, torch.bfloat16
-        )
+        if weight_padded_k != weight_original_k:
+            scratch = _get_or_alloc_padded_activation_scratch(
+                q_input, weight_padded_k
+            )
+            scratch[:, :weight_original_k].copy_(q_input)
+            q_input_for_gemm = scratch
+        else:
+            q_input_for_gemm = q_input
+        if weight_is_shuffled:
+            output = aiter.gemm_a8w8_bpreshuffle(
+                q_input_for_gemm, weight, x_scale, weight_scale, None, torch.bfloat16
+            )
+        else:
+            output = aiter.gemm_a8w8_CK(
+                q_input_for_gemm, weight, x_scale, weight_scale, None, torch.bfloat16
+            )
         if bias is not None:
             output = output + bias
         return output.view(*output_shape)
@@ -1699,9 +1760,25 @@ def apply_fp8_ptpc_linear(
         # weight is in (N, K)
         output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    output = aiter.gemm_a8w8_bpreshuffle(
-        q_input, weight, x_scale, weight_scale, None, input.dtype
-    )
+    if weight_padded_k != weight_original_k:
+        scratch = _get_or_alloc_padded_activation_scratch(q_input, weight_padded_k)
+        scratch[:, :weight_original_k].copy_(q_input)
+        q_input_for_gemm = scratch
+    else:
+        q_input_for_gemm = q_input
+
+    if weight_is_shuffled:
+        output = aiter.gemm_a8w8_bpreshuffle(
+            q_input_for_gemm, weight, x_scale, weight_scale, None, input.dtype
+        )
+    else:
+        # Tuning-fallback path: weight is unshuffled at original K, dispatch
+        # to non-preshuffle CK GEMM. ``q_input_for_gemm`` is the unpadded
+        # quantized input here because ``weight_padded_k == weight_original_k``
+        # in the fallback case (set in compressed_tensors_w8a8_fp8.py).
+        output = aiter.gemm_a8w8_CK(
+            q_input_for_gemm, weight, x_scale, weight_scale, None, input.dtype
+        )
     if bias is not None:
         output = output + bias
     return output.view(*output_shape)

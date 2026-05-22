@@ -33,7 +33,11 @@ __all__ = ["CompressedTensorsW8A8Fp8"]
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
-    from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.shuffle import (
+        is_bpreshuffle_kernel_tuned,
+        pad_weight_for_bpreshuffle,
+        shuffle_weight,
+    )
 
 
 strategy_to_parameter_type = {
@@ -177,9 +181,39 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
 
             if _use_aiter:
                 # keep the weight as (N, K)
-                layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)), requires_grad=False
-                )
+                # GLM-4.6V FP8 padding fix: pad K to a bpreshuffle-friendly
+                # alignment, then either shuffle (fast path) or fall back to
+                # gemm_a8w8_CK (no-shuffle) when the bpreshuffle tuner has no
+                # config for this shape. Padding metadata is reattached to
+                # layer.weight after the Parameter wrap because Parameter
+                # strips Python tensor attributes.
+                original_k = weight.shape[-1]
+                padded_w = pad_weight_for_bpreshuffle(weight)
+                padded_k = padded_w.shape[-1]
+                if is_bpreshuffle_kernel_tuned(
+                    weight.shape[0], padded_k, weight.dtype
+                ):
+                    shuffled = shuffle_weight(padded_w, (16, 16))
+                    layer.weight = Parameter(shuffled, requires_grad=False)
+                    layer.weight.aiter_original_k = original_k
+                    layer.weight.aiter_padded_k = padded_k
+                    layer.weight.aiter_k_padding = padded_k - original_k
+                    layer.weight.aiter_is_shuffled = True
+                else:
+                    # Tuning fallback: keep weight unshuffled at the original
+                    # K so apply_fp8_ptpc_linear routes through gemm_a8w8_CK
+                    # with no padding cost.
+                    layer.weight = Parameter(
+                        weight.contiguous(), requires_grad=False
+                    )
+                    layer.weight.aiter_original_k = original_k
+                    layer.weight.aiter_padded_k = original_k
+                    layer.weight.aiter_k_padding = 0
+                    layer.weight.aiter_is_shuffled = False
+                del padded_w
+                del weight
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             else:
                 layer.weight = Parameter(weight.t(), requires_grad=False)
 
