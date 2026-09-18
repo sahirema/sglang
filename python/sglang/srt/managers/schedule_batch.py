@@ -2339,6 +2339,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
+    # Scratch hand-off, written by mem_cache/allocation.py alloc_for_decode and
+    # consumed immediately by prepare_for_decode: the paged decode allocator
+    # already has to materialise `seq_lens + token_per_req` to size its
+    # allocation, so the caller adopts that tensor instead of recomputing the
+    # identical [b] add. None whenever the allocator did not build one (the
+    # page_size == 1 branch). Never read outside that hand-off.
+    seq_lens_next: Optional[torch.Tensor] = None  # shape: [b], int64
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: torch.Tensor = None  # shape: [b], int32
@@ -3468,7 +3475,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # New-tensor avoids racing model_worker_batch refs queued for
         # overlap forward.
-        self.seq_lens = self.seq_lens + 1
+        #
+        # alloc_for_decode's paged branch already built `seq_lens + 1` (it is
+        # called with token_per_req=1, so the value is identical to the add
+        # below) and left it in seq_lens_next. Adopting it drops one [b]
+        # elementwise launch from every decode step, which matters because
+        # decode here is bound by launch count, not by arithmetic. It satisfies
+        # the same invariant as the add: it is a freshly allocated tensor that
+        # aliases neither the previous self.seq_lens nor any allocator buffer.
+        seq_lens_next = self.seq_lens_next
+        self.seq_lens_next = None
+        self.seq_lens = (
+            seq_lens_next if seq_lens_next is not None else self.seq_lens + 1
+        )
         self.seq_lens_cpu = self.seq_lens_cpu + 1
         self.orig_seq_lens = self.orig_seq_lens + 1
         # Sum is recomputed lazily by ForwardBatch.init_new.
