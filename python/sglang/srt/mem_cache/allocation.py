@@ -11,6 +11,7 @@ import triton.language as tl
 from sglang.kernels.ops.memory.common import (
     get_last_loc_triton,
     get_last_loc_triton_safe,
+    get_last_loc_triton_safe_i32,
     write_req_to_token_pool_triton,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
@@ -552,11 +553,32 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     if _alloc_page_size(batch) == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+        # No seq_lens_next is materialised on this branch; see the stash below.
+        seq_lens_next = None
     else:
-        # Paged allocation
-        last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, seq_lens_gpu - 1
-        ]
+        # Paged allocation.
+        #
+        # One fused Triton launch replaces the equivalent torch expression
+        # `req_to_token[req_pool_indices, seq_lens_gpu - 1]`, which costs two
+        # launches: an elementwise `sub` on a [bs] tensor and an advanced-index
+        # gather. Decode runs this per step on bs-sized (e.g. 16) tensors where
+        # kernel-launch overhead dominates the arithmetic entirely, so halving
+        # the launch count here is the whole point.
+        #
+        # The _i32 variant is deliberate: plain indexing returns req_to_token's
+        # own dtype (int32, memory_pool.py ReqToTokenPool.__init__), and the
+        # consumer `alloc_decode_kernel` reads last_loc through a bare
+        # `tl.load`, so staying in int32 reproduces today's numerics exactly
+        # and avoids paying a promotion kernel that would undo the saving.
+        #
+        # Requiring Triton here is not a new constraint: this same branch
+        # already launches the Triton `alloc_decode_kernel` via
+        # `alloc_paged_token_slots_decode` a few lines below.
+        last_loc = get_last_loc_triton_safe_i32(
+            batch.req_to_token_pool.req_to_token,
+            batch.req_pool_indices,
+            seq_lens_gpu,
+        )
         seq_lens_next = seq_lens_gpu + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
@@ -573,11 +595,32 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + seq_lens_gpu
     else:
-        locs = seq_lens_gpu.clone()
+        # Deliberately NOT a clone. `write` is an `index_put_`, which only ever
+        # READS its index tensor, and ScheduleBatch never mutates seq_lens in
+        # place -- every update rebinds a fresh tensor (see prepare_for_decode,
+        # filter_batch and merge_batch in managers/schedule_batch.py, whose
+        # out-of-place `self.seq_lens = self.seq_lens + 1` is itself documented
+        # as avoiding races with overlap-queued refs). Aliasing is therefore
+        # safe and saves one [bs] copy_ launch on every decode step.
+        locs = seq_lens_gpu
 
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
+
+    # Hand the already-computed `seq_lens + token_per_req` to the caller rather
+    # than making it recompute the same [bs] add. Safe to reuse as batch state:
+    # it is a freshly allocated tensor (aliasing nothing), and no alloc_decode
+    # implementation writes to the seq_lens argument it was passed -- they all
+    # only `tl.load` from it (see allocator/paged.py alloc_decode_kernel).
+    #
+    # The hand-off contract is specifically "seq_lens advanced by one token",
+    # which is what the sole consumer (ScheduleBatch.prepare_for_decode) then
+    # adopts as the new batch.seq_lens. Publishing None for any other
+    # token_per_req, and for the page_size == 1 branch that never builds the
+    # tensor, makes that consumer fall back to its own add instead of silently
+    # adopting a wrong sequence length -- which would corrupt attention.
+    batch.seq_lens_next = seq_lens_next if token_per_req == 1 else None
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:

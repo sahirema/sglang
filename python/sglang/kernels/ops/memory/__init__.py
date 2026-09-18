@@ -15,6 +15,7 @@ _TRITON_KERNELS = [
     ("common", "write_req_to_token_pool_triton"),
     ("common", "get_last_loc_triton"),
     ("common", "get_last_loc_triton_safe"),
+    ("common", "get_last_loc_triton_safe_i32"),
     ("virtual_slot", "alloc_bind_inplace"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
