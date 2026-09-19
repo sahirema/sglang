@@ -15,6 +15,7 @@
 # Adapted from DeepSeek and Mixtral implementation
 """Inference-only MiniMax M3 model compatible with HuggingFace weights."""
 
+import functools
 import logging
 from contextlib import nullcontext
 from typing import Iterable, List, Optional, Set, Tuple, Union
@@ -123,6 +124,17 @@ _FP8_KV_DTYPES = (
 # equal the CUDA warp size (32) so each warp norms+ropes one head in one pass.
 _M3_FUSED_QKNORM_ROPE_ROTARY_DIM = 64
 
+# aiter's fused_qknorm_idxrqknorm hardwires head_dim 128 (kHeadDim, a compile-time
+# constant) for every group it touches, including the index heads.
+_M3_AITER_FUSED_QKNORM_HEAD_DIM = 128
+
+# Set once if the aiter kernel ever raises, to keep the process on the Triton path.
+_aiter_fused_qknorm_failed = False
+# Latch for the one-shot static-gate report emitted from __init__ below. The gate
+# is opt-in and A/B-only, and an unmet term otherwise leaves NO trace at all, so a
+# silently-inert arm would be indistinguishable from a measured null.
+_aiter_fused_qknorm_gate_logged = False
+
 _has_rocm_qk_norm_rope = False
 if _is_hip:
     try:
@@ -147,6 +159,23 @@ if _is_npu:
     )
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _load_aiter_fused_qknorm_idxrqknorm():
+    """aiter's fused qk-norm + RoPE HIP kernel, or None when it is unavailable.
+
+    Imported lazily so that neither a missing nor a broken aiter install can break
+    module import on a non-ROCm build.
+    """
+    if not _is_hip:
+        return None
+    try:
+        from aiter import fused_qknorm_idxrqknorm
+    except Exception:
+        logger.debug("aiter.fused_qknorm_idxrqknorm is not importable", exc_info=True)
+        return None
+    return fused_qknorm_idxrqknorm if callable(fused_qknorm_idxrqknorm) else None
 
 
 class MultiHeadRMSNorm(nn.Module):
@@ -794,6 +823,98 @@ class MiniMaxM3Attention(nn.Module):
             and self.index_rotary_emb is self.rotary_emb
         )
 
+        # ROCm + fp8 main KV: _sparse_qk_index_norm_rope_cache refuses the Triton
+        # cache-fusion kernel (it writes bf16 straight into the paged cache) and
+        # falls back to a standalone norm+RoPE launch. aiter's
+        # fused_qknorm_idxrqknorm supersedes that fallback with one HIP kernel that
+        # norms+RoPEs main Q/K and index Q/K in place inside the fused projection
+        # output, so no separate q/k/idx_q/idx_k output buffers are allocated.
+        # Only the norm+RoPE half is fused -- see the comment in
+        # _maybe_aiter_sparse_qk_index_norm_rope for why the kernel's fp8 cache
+        # insert is deliberately not used.
+        # Split into cheap prerequisites and named terms. The prerequisites MUST keep
+        # short-circuiting: every term below reads an attribute (q_norm, index_q_norm,
+        # rotary_emb, ...) that exists only on a sparse attention layer, so evaluating
+        # them eagerly on a dense layer would raise AttributeError.
+        aiter_qknorm_prereq = {
+            "is_hip": _is_hip,
+            "env_enabled": envs.SGLANG_MINIMAX_AITER_FUSED_QKNORM.get(),
+            "is_sparse_attention_layer": self.is_sparse_attention_layer,
+        }
+        aiter_qknorm_terms = (
+            {
+                "qk_norm_type_is_per_head": self.qk_norm_type == "per_head",
+                "use_gemma_norm": self.use_gemma_norm,
+                "fuse_qkv_index_enabled": self._fuse_qkv_index_enabled,
+                "disable_index_value": self.disable_index_value,
+                "num_heads_gt0": self.num_heads > 0,
+                "num_kv_heads_gt0": self.num_kv_heads > 0,
+                "num_idx_heads_gt0": self.num_idx_heads > 0,
+                "head_dim_is_128": self.head_dim == _M3_AITER_FUSED_QKNORM_HEAD_DIM,
+                "idx_head_dim_is_128": (
+                    self.idx_head_dim == _M3_AITER_FUSED_QKNORM_HEAD_DIM
+                ),
+                "rotary_dim_gt0": self.rotary_dim > 0,
+                "rotary_dim_mult_of_8": self.rotary_dim % 8 == 0,
+                "rotary_dim_le_128": (
+                    self.rotary_dim <= _M3_AITER_FUSED_QKNORM_HEAD_DIM
+                ),
+                "has_cos_sin_cache": hasattr(self.rotary_emb, "cos_sin_cache"),
+                "rotary_emb_dim_matches": self.rotary_emb.rotary_dim == self.rotary_dim,
+                "is_neox_style": getattr(self.rotary_emb, "is_neox_style", False),
+                "index_rotary_emb_is_shared": self.index_rotary_emb is self.rotary_emb,
+                "qk_eps_match": (
+                    self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+                ),
+                "index_q_eps_matches_q": (
+                    self.index_q_norm.variance_epsilon == self.q_norm.variance_epsilon
+                ),
+                "index_k_eps_matches_q": (
+                    self.index_k_norm.variance_epsilon == self.q_norm.variance_epsilon
+                ),
+            }
+            if all(aiter_qknorm_prereq.values())
+            else {}
+        )
+        self._can_use_aiter_fused_qknorm_static = all(
+            aiter_qknorm_prereq.values()
+        ) and all(aiter_qknorm_terms.values())
+
+        # One-shot report, only once the operator has opted in. Reported at WARNING
+        # when the gate is closed, because that is the case an A/B silently
+        # mismeasures: the arm would run the unmodified Triton path and report a
+        # clean null that looks like a real negative result.
+        global _aiter_fused_qknorm_gate_logged
+        if aiter_qknorm_prereq["env_enabled"] and not _aiter_fused_qknorm_gate_logged:
+            _aiter_fused_qknorm_gate_logged = True
+            checks = {**aiter_qknorm_prereq, **aiter_qknorm_terms}
+            unmet = [name for name, ok in checks.items() if not ok]
+            if self._can_use_aiter_fused_qknorm_static:
+                logger.info(
+                    "SGLANG_MINIMAX_AITER_FUSED_QKNORM: static gate OPEN (%d checks "
+                    "passed); aiter fused_qknorm_idxrqknorm will be used on sparse "
+                    "layers whose main KV cache is fp8.",
+                    len(checks),
+                )
+            else:
+                logger.warning(
+                    "SGLANG_MINIMAX_AITER_FUSED_QKNORM=1 but the static gate is "
+                    "CLOSED -- the fused kernel will NEVER run and this arm is "
+                    "inert. Unmet: %s",
+                    ", ".join(unmet),
+                )
+        # Column width the kernel requires of the single fused qkv tensor:
+        # (num_heads + 2*num_kv_heads + num_index_heads + 1) * 128, i.e. exactly the
+        # fused qkv+index projection output (q | k | v | idx_q | idx_k).
+        self._aiter_fused_qknorm_width = (
+            self._fused_main_size + (self.num_idx_heads + 1) * self.idx_head_dim
+            if self.is_sparse_attention_layer
+            else 0
+        )
+        # Resolved on the first call instead of here: the norm weights are still
+        # unloaded (and possibly not yet on device) while __init__ runs.
+        self._aiter_qknorm_weights_ok: Optional[bool] = None
+
     def _can_use_rocm_qk_norm_rope(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> bool:
@@ -975,6 +1096,178 @@ class MiniMaxM3Attention(nn.Module):
             and idx_k.dtype == q.dtype
         )
 
+    def _aiter_fused_qknorm_views_ok(
+        self,
+        fused_out: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+    ) -> bool:
+        """True iff q/k/idx_q/idx_k alias ``fused_out`` at the column offsets the
+        aiter kernel assumes (q | k | v | idx_q | idx_k).
+
+        The kernel rewrites those columns in place, so the caller may only keep
+        using its existing views if they really are views at those offsets.
+        """
+        base = fused_out.data_ptr()
+        item = fused_out.element_size()
+        off_iq = self._fused_main_size
+        off_ik = off_iq + self.num_idx_heads * self.idx_head_dim
+        return (
+            q.data_ptr() == base
+            and k.data_ptr() == base + self.q_size * item
+            and idx_q.data_ptr() == base + off_iq * item
+            and idx_k.data_ptr() == base + off_ik * item
+        )
+
+    def _aiter_fused_qknorm_weights_ok(self) -> bool:
+        """Whether the four norm weights satisfy the aiter kernel's own checks.
+
+        Resolved once and cached: the weights are frozen after loading, and this
+        runs on every sparse layer of every forward. Only their mutual dtype
+        agreement is established here -- the caller still has to match them
+        against the qkv dtype.
+        """
+        cached = self._aiter_qknorm_weights_ok
+        if cached is None:
+            weights = (
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.index_q_norm.weight,
+                self.index_k_norm.weight,
+            )
+            cached = all(
+                w.is_cuda
+                and w.is_contiguous()
+                and w.numel() == _M3_AITER_FUSED_QKNORM_HEAD_DIM
+                and w.dtype == weights[0].dtype
+                for w in weights
+            )
+            self._aiter_qknorm_weights_ok = cached
+        return cached
+
+    def _maybe_aiter_sparse_qk_index_norm_rope(
+        self,
+        positions: torch.Tensor,
+        fused_out: Optional[torch.Tensor],
+        q: torch.Tensor,
+        k: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+        main_kv_is_fp8: bool,
+    ) -> bool:
+        """Norm+RoPE main Q/K and index Q/K in place via aiter, on ROCm.
+
+        Returns True iff the aiter kernel ran and ``fused_out`` (hence the q/k/
+        idx_q/idx_k views into it) now holds the normed+roped values.
+
+        Scoped to an fp8 main K/V cache (``main_kv_is_fp8``): that is the only
+        configuration in which the cache-fusing Triton kernel above is refused,
+        and it fuses strictly more than this one does, so it must keep winning
+        wherever it is eligible.
+
+        Only the norm+RoPE half of aiter's fused_qknorm_idxrqknorm is used. Its
+        fp8 cache-insert mode is deliberately NOT wired up: on an fp8 cache that
+        kernel always per-token dynamically quantizes (scale = amax/fp8_max, see
+        csrc/kernels/fused_qknorm_idxrqknorm.cu:424-445 for K and :346-367 for V)
+        and emits the scales into a [num_kv_heads, max_kv_tokens] tensor, whereas
+        every MiniMax sparse reader in SGLang assumes a *unit-scaled* fp8 cache and
+        dequantizes with a bare widening cast -- see
+        kernels/ops/attention/minimax_sparse/decode/topk_sparse.py:180-185 and the
+        contract in kernels/ops/attention/minimax_sparse/common/utils.py:12-16.
+        Inserting through aiter without teaching those kernels to apply the scales
+        would silently scale every cached K/V value. So the cache writes stay on
+        today's path and only the norm+RoPE is fused here.
+        """
+        global _aiter_fused_qknorm_failed
+        if (
+            _aiter_fused_qknorm_failed
+            or not main_kv_is_fp8
+            or not self._can_use_aiter_fused_qknorm_static
+        ):
+            return False
+        # Every argument constraint below mirrors one of the kernel's own host-side
+        # AITER_CHECKs (csrc/kernels/fused_qknorm_idxrqknorm.cu:641-696 are the ones
+        # reachable without cache insert). They are re-checked here rather than left
+        # to the kernel because AITER_CHECK calls std::abort() unless the runtime has
+        # enabled throwing (csrc/include/aiter_hip_common.h:43-74), i.e. a violation
+        # can take the server down instead of raising into the fallback below.
+        if fused_out is None or fused_out.dim() != 2:
+            return False
+        if (
+            not fused_out.is_cuda
+            or not fused_out.is_contiguous()
+            or fused_out.shape[1] != self._aiter_fused_qknorm_width
+            or fused_out.dtype not in (torch.bfloat16, torch.float16)
+        ):
+            return False
+        num_tokens = fused_out.shape[0]
+        if num_tokens == 0:
+            return False
+        if (
+            not positions.is_cuda
+            or positions.dim() != 1
+            or positions.dtype != torch.int64
+            or not positions.is_contiguous()
+            or positions.shape[0] < num_tokens
+        ):
+            return False
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        if (
+            not cos_sin_cache.is_cuda
+            or cos_sin_cache.dim() != 2
+            or cos_sin_cache.shape[1] != self.rotary_dim
+            or cos_sin_cache.dtype != fused_out.dtype
+            or not cos_sin_cache.is_contiguous()
+        ):
+            return False
+        if (
+            self.q_norm.weight.dtype != fused_out.dtype
+            or not self._aiter_fused_qknorm_weights_ok()
+        ):
+            return False
+        if not self._aiter_fused_qknorm_views_ok(fused_out, q, k, idx_q, idx_k):
+            return False
+        fused_qknorm_idxrqknorm = _load_aiter_fused_qknorm_idxrqknorm()
+        if fused_qknorm_idxrqknorm is None:
+            return False
+        try:
+            # No cache tensors -> insert mode off, so the kernel norms+RoPEs q, k,
+            # idx_q and idx_k in place in fused_out and leaves the V columns as-is.
+            fused_qknorm_idxrqknorm(
+                fused_out,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                cos_sin_cache,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                self.rotary_dim,
+                self.q_norm.variance_epsilon,
+                index_q_norm_weight=self.index_q_norm.weight.data,
+                index_k_norm_weight=self.index_k_norm.weight.data,
+                num_index_heads=self.num_idx_heads,
+            )
+        except Exception:
+            # Reachable for a failed aiter JIT build (the op is compiled on first
+            # call) and for an argument the checks above did not catch. Every
+            # contract check in the kernel is host-side and pre-launch
+            # (csrc/kernels/fused_qknorm_idxrqknorm.cu:641-890), so in both cases
+            # fused_out was not written and the Triton fallback below is exact.
+            # Not swallowed: the path is disabled process-wide and logged once, so
+            # a broken kernel shows up as a warning rather than as silent slowness.
+            _aiter_fused_qknorm_failed = True
+            logger.warning(
+                "aiter.fused_qknorm_idxrqknorm failed; disabling the fused "
+                "MiniMax-M3 qk-norm+RoPE path for this process and falling back to "
+                "the Triton kernel. Set SGLANG_MINIMAX_AITER_FUSED_QKNORM=0 to skip "
+                "it entirely.",
+                exc_info=True,
+            )
+            return False
+        return True
+
     def _sparse_qk_index_norm_rope(
         self,
         positions: torch.Tensor,
@@ -1032,10 +1325,13 @@ class MiniMaxM3Attention(nn.Module):
         idx_k: torch.Tensor,
         idx_v: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        fused_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         kv_pool = self._get_sparse_kv_pool()
         # The fused kernel writes normed bf16 K/V straight into the paged cache, so an
         # fp8 main K/V cache (--kv-cache-dtype fp8_*) can't use it; fall back to norm+rope.
+        # On ROCm the aiter path below supersedes that fallback for the norm+RoPE half,
+        # leaving the cache writes to the attention backend.
         main_kv_is_fp8 = kv_pool is not None and kv_pool.dtype in _FP8_KV_DTYPES
         can_use_cache_fusion = (
             not main_kv_is_fp8
@@ -1074,6 +1370,11 @@ class MiniMaxM3Attention(nn.Module):
                 self.rotary_emb.is_neox_style,
             )
             self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
+            return q, k, idx_q, idx_k
+        if self._maybe_aiter_sparse_qk_index_norm_rope(
+            positions, fused_out, q, k, idx_q, idx_k, main_kv_is_fp8
+        ):
+            # Written in place: q/k/idx_q/idx_k are views into fused_out.
             return q, k, idx_q, idx_k
         return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
 
@@ -1203,7 +1504,7 @@ class MiniMaxM3Attention(nn.Module):
             else:
                 idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
                 q, k, idx_q, idx_k = self._sparse_qk_index_norm_rope_cache(
-                    positions, q, k, v, idx_q, idx_k, idx_v, forward_batch
+                    positions, q, k, v, idx_q, idx_k, idx_v, forward_batch, fused_out
                 )
 
             inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)

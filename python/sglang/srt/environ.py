@@ -1647,6 +1647,16 @@ class Envs:
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
+    # MiniMax-M3 sparse layers on ROCm: route the qk-norm + RoPE for main Q/K and
+    # index Q/K through aiter's fused_qknorm_idxrqknorm HIP kernel instead of the
+    # Triton sparse_qk_index_gemma_rmsnorm_rope kernel. Requires the fused
+    # qkv+index projection, whose output is one contiguous
+    # [num_tokens, (num_heads + 2*num_kv_heads + num_index_heads + 1) * 128] buffer
+    # that the kernel norms+RoPEs in place (no separate q/k/idx output buffers).
+    # The kernel's fp8 cache insert is NOT used -- it per-token dynamically
+    # quantizes, while the sparse attention kernels assume a unit-scaled fp8 cache.
+    # Opt-in, for A/B against the Triton path.
+    SGLANG_MINIMAX_AITER_FUSED_QKNORM = EnvBool(False)
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
