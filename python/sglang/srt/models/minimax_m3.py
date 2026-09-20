@@ -124,9 +124,15 @@ _FP8_KV_DTYPES = (
 _M3_FUSED_QKNORM_ROPE_ROTARY_DIM = 64
 
 _has_rocm_qk_norm_rope = False
+# Main-KV cache dtypes the fused ROCm cache kernel can write itself. Bound
+# empty so non-ROCm builds, which also reach
+# _sparse_qk_index_norm_rope_cache, resolve the name; the ROCm import below
+# replaces it with the kernel's own tuple.
+_FUSED_CACHE_FP8_DTYPES: Tuple[torch.dtype, ...] = ()
 if _is_hip:
     try:
         from sglang.kernels.ops.attention.minimax_m3_qk_norm_rope import (
+            _FUSED_CACHE_FP8_DTYPES,
             qk_gemma_rmsnorm_rope,
             sparse_qk_index_gemma_rmsnorm_rope,
             sparse_qk_index_gemma_rmsnorm_rope_cache,
@@ -1034,11 +1040,18 @@ class MiniMaxM3Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         kv_pool = self._get_sparse_kv_pool()
-        # The fused kernel writes normed bf16 K/V straight into the paged cache, so an
-        # fp8 main K/V cache (--kv-cache-dtype fp8_*) can't use it; fall back to norm+rope.
-        main_kv_is_fp8 = kv_pool is not None and kv_pool.dtype in _FP8_KV_DTYPES
+        # The fused kernel writes the paged K/V cache itself, so it must be able
+        # to produce the pool's dtype. bf16/fp16 pass through unquantized;
+        # fp8_e4m3fn is quantized in-kernel, mirroring store_kvcache_quant.
+        # fp8_e5m2 and the fnuz (gfx94x) variant are unimplemented rather than
+        # unsupported -- they keep falling back to norm+rope plus a separate store.
+        main_kv_dtype = kv_pool.dtype if kv_pool is not None else None
+        main_kv_cache_writable = main_kv_dtype is not None and (
+            main_kv_dtype not in _FP8_KV_DTYPES
+            or main_kv_dtype in _FUSED_CACHE_FP8_DTYPES
+        )
         can_use_cache_fusion = (
-            not main_kv_is_fp8
+            main_kv_cache_writable
             and idx_v is None
             and self._can_use_rocm_sparse_qk_index_norm_rope(
                 positions, q, k, idx_q, idx_k
@@ -1052,29 +1065,50 @@ class MiniMaxM3Attention(nn.Module):
             layer_id = self.attn.layer_id
             k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
             idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
-            q, k, idx_q, idx_k = sparse_qk_index_gemma_rmsnorm_rope_cache(
-                q,
-                k,
-                v,
-                idx_q,
-                idx_k,
-                k_cache,
-                v_cache,
-                idx_k_cache,
-                forward_batch.out_cache_loc,
-                self.q_norm.weight.data,
-                self.k_norm.weight.data,
-                self.index_q_norm.weight.data,
-                self.index_k_norm.weight.data,
-                positions,
-                self.rotary_emb.cos_sin_cache,
-                self.q_norm.variance_epsilon,
-                self.head_dim,
-                self.rotary_dim,
-                self.rotary_emb.is_neox_style,
-            )
-            self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
-            return q, k, idx_q, idx_k
+            # index_k is stored unquantized, so the index pool must already hold
+            # the activation dtype. It does -- the pool is built with
+            # index_dtype=model_dtype (kv_cache_configurator
+            # ._build_minimax_sparse_kv_pool) independently of --kv-cache-dtype --
+            # but a differently-built pool falls back here rather than tripping
+            # the launcher's assert mid-forward.
+            if idx_k_cache.dtype == idx_k.dtype and k_cache.dtype == v_cache.dtype:
+                # Match the store this replaces: the fallback in
+                # MiniMaxSparseKVPool.set_fused_kv_index_buffer forwards
+                # layer.k_scale_float/v_scale_float (passed at
+                # minimax_sparse_backend.py:1390, :1628) to
+                # MHATokenToKVPool.set_kv_buffer, which applies a non-None scale
+                # as an in-place div_ before the fp8 cast (memory_pool.py:2581).
+                # None means unit scale there, so it maps to 1.0 here.
+                # Index-K takes no scale: set_index_k_buffer applies one only
+                # when a dtype conversion is needed (memory_pool.py:5593), and
+                # the branch above has already established the dtypes match.
+                k_scale = self.attn.k_scale_float
+                v_scale = self.attn.v_scale_float
+                q, k, idx_q, idx_k = sparse_qk_index_gemma_rmsnorm_rope_cache(
+                    q,
+                    k,
+                    v,
+                    idx_q,
+                    idx_k,
+                    k_cache,
+                    v_cache,
+                    idx_k_cache,
+                    forward_batch.out_cache_loc,
+                    self.q_norm.weight.data,
+                    self.k_norm.weight.data,
+                    self.index_q_norm.weight.data,
+                    self.index_k_norm.weight.data,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.q_norm.variance_epsilon,
+                    self.head_dim,
+                    self.rotary_dim,
+                    self.rotary_emb.is_neox_style,
+                    k_scale=1.0 if k_scale is None else k_scale,
+                    v_scale=1.0 if v_scale is None else v_scale,
+                )
+                self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
+                return q, k, idx_q, idx_k
         return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
 
     def forward_prepare_npu(

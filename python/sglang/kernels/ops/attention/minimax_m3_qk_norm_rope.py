@@ -7,6 +7,14 @@ import torch
 import triton
 import triton.language as tl
 
+# Main K/V cache dtypes this kernel can produce itself. OCP e4m3 only: gfx950
+# maps torch.float8_e4m3fn onto tl.float8e4nv, which Triton lowers natively
+# there (verified under 3.6.0 and 3.7.0). e5m2 and the fnuz (gfx94x) variant
+# are deliberately absent -- unimplemented, not unsupported, and the caller
+# falls back rather than silently writing wrong bytes.
+_FUSED_CACHE_FP8_DTYPES = (torch.float8_e4m3fn,)
+_FP8_E4M3_MAX = 448.0
+
 
 @triton.jit
 def _qk_gemma_rmsnorm_rope_kernel(
@@ -409,6 +417,8 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     idx_k_cache_stride_s,
     idx_k_cache_stride_h,
     idx_k_cache_stride_d,
+    k_inv_scale,
+    v_inv_scale,
     q_heads: tl.constexpr,
     k_heads: tl.constexpr,
     idx_q_heads: tl.constexpr,
@@ -416,6 +426,8 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     rotary_dim: tl.constexpr,
     eps: tl.constexpr,
     is_neox_style: tl.constexpr,
+    QUANT_KV: tl.constexpr,
+    FP8_MAX: tl.constexpr,
     BLOCK_HD: tl.constexpr,
 ):
     token_id = tl.program_id(0)
@@ -540,8 +552,6 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
         + head_id * k_cache_stride_h
         + cols * k_cache_stride_d
     )
-    tl.store(cache_k_base, out_typed, mask=mask & is_k)
-
     v_base = v_ptr + token_id * v_stride_m + head_id * head_dim * v_stride_d
     v_val = tl.load(v_base + cols * v_stride_d, mask=mask & is_k, other=0.0)
     cache_v_base = (
@@ -550,7 +560,29 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
         + head_id * v_cache_stride_h
         + cols * v_cache_stride_d
     )
-    tl.store(cache_v_base, v_val, mask=mask & is_k)
+    if QUANT_KV:
+        # Scale by the inverse KV scale, clamp, convert. The source is the
+        # *rounded* out_typed / v_val, not the fp32 accumulator, because the
+        # store this replaces quantizes the tensor this kernel would
+        # otherwise have returned to the caller.
+        #
+        # The clamp is a deliberate divergence from the unfused path, which
+        # ends in torch's `.to(self.dtype)` (memory_pool.py:2585) and emits
+        # NaN (0x7f / 0xff) above 448 rather than saturating. Measured on
+        # gfx950 / triton 3.7.0: bit-identical for every in-range input,
+        # divergent only where the unfused path would poison the KV cache
+        # with NaN. Saturating matches StoreKVCacheQuantKernel's `quant_vec`
+        # (kvcache.cuh), which is the behaviour the fp8 KV path elsewhere
+        # already relies on.
+        k_q = out_typed.to(tl.float32) * k_inv_scale
+        k_q = tl.minimum(tl.maximum(k_q, -FP8_MAX), FP8_MAX)
+        tl.store(cache_k_base, k_q.to(k_cache_ptr.dtype.element_ty), mask=mask & is_k)
+        v_q = v_val.to(tl.float32) * v_inv_scale
+        v_q = tl.minimum(tl.maximum(v_q, -FP8_MAX), FP8_MAX)
+        tl.store(cache_v_base, v_q.to(v_cache_ptr.dtype.element_ty), mask=mask & is_k)
+    else:
+        tl.store(cache_k_base, out_typed, mask=mask & is_k)
+        tl.store(cache_v_base, v_val, mask=mask & is_k)
 
     is_idx_k = head_program == idx_k_program
     idx_cache_base = (
@@ -579,6 +611,8 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     head_dim: int,
     rotary_dim: int,
     is_neox_style: bool,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse sparse Q/K/index norm+RoPE with main KV and index-K cache stores."""
     assert q.dim() == k.dim() == v.dim() == idx_q.dim() == idx_k.dim() == 2
@@ -598,6 +632,17 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     idx_q_heads = idx_q.shape[1] // head_dim
     assert k_cache.shape[1] == v_cache.shape[1] == k_heads
     assert idx_k_cache.shape[1] == 1
+    assert k_cache.dtype == v_cache.dtype
+    # The index-K pool is built from `model_dtype`, not `kv_cache_dtype`
+    # (kv_cache_configurator._build_minimax_sparse_kv_pool), so it stays
+    # unquantized even when the main K/V cache is fp8. Mixed-dtype is the
+    # normal case here, not an edge case.
+    assert idx_k_cache.dtype == idx_k.dtype
+    quant_kv = k_cache.dtype in _FUSED_CACHE_FP8_DTYPES
+    # Without quantization the kernel stores `out_typed`, which is q.dtype --
+    # so a cache in any other dtype would be written as reinterpreted bytes.
+    assert quant_kv or k_cache.dtype == q.dtype
+    assert k_scale > 0.0 and v_scale > 0.0
 
     q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
@@ -646,6 +691,8 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
         idx_k_cache.stride(0),
         idx_k_cache.stride(1),
         idx_k_cache.stride(2),
+        1.0 / k_scale,
+        1.0 / v_scale,
         q_heads,
         k_heads,
         idx_q_heads,
@@ -653,6 +700,8 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
         rotary_dim,
         eps,
         is_neox_style,
+        QUANT_KV=quant_kv,
+        FP8_MAX=_FP8_E4M3_MAX,
         BLOCK_HD=block_hd,
         num_warps=4,
     )
