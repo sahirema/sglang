@@ -1652,6 +1652,13 @@ class Envs:
     # AiterAttnBackend._use_fused_fp8_kv_write; the flag exists so the sparse
     # layers can be A/B'd against the set_kv_buffer path.
     SGLANG_OPT_USE_MINIMAX_SPARSE_FP8_KV_STORE = EnvBool(False)
+    # A7: route the MiniMax sparse index-K cache store through the JIT
+    # store_cache kernel instead of torch index_put_. MEASUREMENT ONLY --
+    # it aliases k_cache/v_cache, which the kernel declares __restrict__,
+    # so it is formally UB and issues the write twice to the same address.
+    # Output is bit-identical and it is a strict LOWER bound on a proper
+    # K-only kernel. Do not enable in production.
+    SGLANG_OPT_INDEX_K_STORE_CACHE = EnvBool(False)
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
