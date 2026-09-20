@@ -111,6 +111,7 @@ _is_xpu = is_xpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
+_A7_INDEX_K_STORE_CACHE = envs.SGLANG_OPT_INDEX_K_STORE_CACHE.get()
 # `SGLANG_AITER_KV_CACHE_LAYOUT` is only meaningful on the ROCm AITER backend
 # (HIP + --enable-aiter / SGLANG_USE_AITER=1). On any other platform / backend
 # the SHUFFLE 5D pool layout has no consumer kernels, so the env var is
@@ -5327,6 +5328,21 @@ class MHATokenToKOnlyPool(KVCache):
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
+        if _A7_INDEX_K_STORE_CACHE:
+            # index_put_ costs 287.1 us/step here against 225.6 for
+            # store_cache on a STRICTLY LARGER write (main pool: 2 heads,
+            # K and V, vs 1 head K here). Both pools land on row_bytes=256,
+            # so the JIT module is already resident -- no new compile.
+            buf = self.k_buffer[layer_id].flatten(1)
+            src = cache_k.flatten(1)
+            row_bytes = buf.shape[-1] * buf.element_size()
+            if can_use_store_cache(row_bytes):
+                # v aliases k deliberately: same thread, same value, same
+                # address, so the result is identical to the index_put_.
+                store_cache(src, src, buf, buf, loc, row_bytes=row_bytes)
+                return
+            # Fall through if the JIT kernel refuses this row width, so an
+            # unsupported size degrades to stock rather than failing.
         self.k_buffer[layer_id][loc] = cache_k
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:

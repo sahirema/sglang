@@ -1647,6 +1647,13 @@ class Envs:
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
+    # A7: route the MiniMax sparse index-K cache store through the JIT
+    # store_cache kernel instead of torch index_put_. MEASUREMENT ONLY --
+    # it aliases k_cache/v_cache, which the kernel declares __restrict__,
+    # so it is formally UB and issues the write twice to the same address.
+    # Output is bit-identical and it is a strict LOWER bound on a proper
+    # K-only kernel. Do not enable in production.
+    SGLANG_OPT_INDEX_K_STORE_CACHE = EnvBool(False)
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
