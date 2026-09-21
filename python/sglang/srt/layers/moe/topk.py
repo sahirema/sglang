@@ -2365,9 +2365,13 @@ def select_experts(
     # slots on the marker) and places that marker at id num_experts, which the
     # DeepEP remap shifts one past the end of the expert space -- 384 -> 392 for
     # 384 routed experts on EP8, where the valid ids are 0..391.
+    # Every aiter path appends too (_post_process_topk_ids: fused_append_shared_experts
+    # for plain TP, the fused append+remap kernel for per-rank slots), and the ungrouped
+    # gates above are already asked for K_routed on aiter -- so a gate that also reserved
+    # a shared column would emit K_routed-1 routed experts plus a duplicate shared id.
     num_fused_shared_experts_for_gate = (
         0
-        if has_per_rank_fused_shared_slots(num_fused_shared_experts)
+        if (_use_aiter or has_per_rank_fused_shared_slots(num_fused_shared_experts))
         else num_fused_shared_experts
     )
     if use_grouped_topk:
