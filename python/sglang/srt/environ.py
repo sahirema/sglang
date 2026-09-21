@@ -1628,6 +1628,11 @@ class Envs:
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
+    # Allow MiniMax-M3 shared-experts fusion on ROCm/gfx950. Upstream rejects
+    # the fusion on every non-CUDA device, so leaving this off reproduces that
+    # rejection exactly and an A/B arm differs from its control only by this
+    # variable. Asked once by the loader, before any layer is built.
+    SGLANG_OPT_USE_MINIMAX_ROCM_SHARED_EXPERTS_FUSION = EnvBool(False)
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
