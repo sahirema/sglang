@@ -12,6 +12,7 @@ from sglang.kernels.ops.memory.common import (
     get_last_loc_triton,
     get_last_loc_triton_safe,
     get_last_loc_triton_safe_i32,
+    write_decode_req_to_token_triton,
     write_req_to_token_pool_triton,
 )
 from sglang.srt.environ import envs
@@ -48,6 +49,7 @@ _is_cpu = is_cpu()
 # var cannot change after import, and alloc_for_decode is on the per-step
 # decode path where a descriptor read per call would itself be overhead.
 _use_fused_decode_alloc = envs.SGLANG_OPT_USE_FUSED_DECODE_ALLOC.get()
+_use_fused_decode_write = envs.SGLANG_OPT_USE_FUSED_DECODE_WRITE.get()
 
 if _is_cpu:
     from sgl_kernel import assign_req_to_token_pool_cpu
@@ -662,9 +664,30 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         # safe and saves one [bs] copy_ launch on every decode step.
         locs = seq_lens_gpu if _use_fused_decode_alloc else seq_lens_gpu.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
+    # One fused Triton launch replaces the cast and the index_put_ that the
+    # `write()` path issues as two kernels. Both pool classes that own a
+    # `write` -- ReqToTokenPool (memory_pool.py) and the standalone
+    # DecodeReqToTokenPool used under PD disaggregation
+    # (disaggregation/decode.py) -- implement it identically as
+    # `self.req_to_token[indices] = values` over an int32
+    # [rows, max_context_len] tensor, so addressing that tensor directly is
+    # equivalent for either.
+    #
+    # The shape guard is not defensive padding: on the page_size == 1 branch
+    # out_cache_loc holds bs * token_per_req entries, which does not match the
+    # [bs] index tensors. Routing that case to `write()` preserves today's
+    # behaviour exactly, including the error it raises.
+    if _use_fused_decode_write and out_cache_loc.numel() == bs:
+        write_decode_req_to_token_triton(
+            batch.req_to_token_pool.req_to_token,
+            batch.req_pool_indices,
+            locs,
+            out_cache_loc,
+        )
+    else:
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+        )
 
     # Hand the already-computed `seq_lens + token_per_req` to the caller rather
     # than making it recompute the same [bs] add. Safe to reuse as batch state:

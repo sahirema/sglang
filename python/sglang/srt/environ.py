@@ -579,6 +579,15 @@ class Envs:
     # image differing only by this variable.
     SGLANG_OPT_USE_FUSED_DECODE_ALLOC = EnvBool(False)
 
+    # Fuse the decode req_to_token bookkeeping write (mem_cache/allocation.py
+    # alloc_for_decode) into one Triton launch: today the int32 cast of
+    # out_cache_loc and the index_put_ scatter are two separate kernels on
+    # [bs]-sized tensors, issued per decode step outside the captured graph.
+    # Independent of SGLANG_OPT_USE_FUSED_DECODE_ALLOC above -- the two gate
+    # different statements in the same function and are meant to be measured
+    # separately as well as stacked. Off by default for the same reason.
+    SGLANG_OPT_USE_FUSED_DECODE_WRITE = EnvBool(False)
+
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
     # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
