@@ -1642,6 +1642,16 @@ class Envs:
     # rejection exactly and an A/B arm differs from its control only by this
     # variable. Asked once by the loader, before any layer is built.
     SGLANG_OPT_USE_MINIMAX_ROCM_SHARED_EXPERTS_FUSION = EnvBool(False)
+    # MiniMax-M3 sparse layers: write the main K/V cache with the Triton
+    # reshape_and_cache_flash kernel (bf16->fp8 cast fused into the paged
+    # scatter) instead of set_kv_buffer's separate div_ + .to() + index_put.
+    # Only applies when the main pool is fp8 and NHD -- the index caches are
+    # model-dtype (kv_cache_configurator passes index_dtype=model_dtype), so
+    # they have no cast to fuse and keep their existing scatter. This is the
+    # same kernel the dense/full-attention layers already use via
+    # AiterAttnBackend._use_fused_fp8_kv_write; the flag exists so the sparse
+    # layers can be A/B'd against the set_kv_buffer path.
+    SGLANG_OPT_USE_MINIMAX_SPARSE_FP8_KV_STORE = EnvBool(False)
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
