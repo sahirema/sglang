@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 from typing import TYPE_CHECKING, Any
@@ -894,6 +895,16 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter():
+            # aiter's MXFP4 per_1x32 kernel and dtype selection key on
+            # ActivationType.Swiglu; "silu" reaches it as ActivationType.Silu and
+            # picks the unclamped kernel. Only clamped-SwiGLU models (MiniMax-M3,
+            # gemm1_clamp_limit > 0) need the switch -- plain-SwiGLU models
+            # (limit unset) keep the path they have today.
+            if (moe_runner_config.gemm1_clamp_limit or 0.0) > 0:
+                moe_runner_config = dataclasses.replace(
+                    moe_runner_config, activation="swiglu"
+                )
+                self.moe_runner_config = moe_runner_config
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
@@ -935,5 +946,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w2_scale=layer.w2_weight_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu,
             fused_moe_kwargs=_fused_moe_kwargs,
+            # Carries the clamp bound to the aiter runner, which selects the
+            # clamped-SwiGLU kernel on it rather than on the activation alone.
+            swiglu_limit=self.moe_runner_config.gemm1_clamp_limit or 0.0,
         )
         return self.runner.run(dispatch_output, quant_info)

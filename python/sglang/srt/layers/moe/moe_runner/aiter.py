@@ -289,13 +289,66 @@ def fused_router_can_bypass_topk(
         return False
     if topk_config.custom_routing_function is not None:
         return False
-    # The entry folds routed_scaling_factor into the top-k weights itself. A caller that
-    # wants it applied to the MoE output instead would have it applied twice.
-    if topk_config.apply_routed_scaling_factor_on_output:
-        return False
+
+    # Deliberately NOT checked: `apply_routed_scaling_factor_on_output`.
+    # It does not mean "scale the MoE output" -- it means the gate kernel folds
+    # the factor into the weights it emits
+    # (moe_fused_gate.py: `if APPLY_SCALE: selected_vals = selected_vals *
+    # routed_scaling_factor`, where selected_vals are the top-k weights). The fused
+    # entry folds it into its own top-k weights, so the two agree and nothing is
+    # applied twice -- which is why `routed_scaling_factor` is passed through below.
+    #
+    # The one model that really does scale the MoE output (bailing_moe_v3) keys that
+    # off a separate attribute, gated on `_enable_a2a_moe and not
+    # should_fuse_routed_scaling_factor_in_topk` -- mutually exclusive with this flag,
+    # and in an a2a mode the check above already refuses.
+
     if topk_config.top_k > entry.max_topk:
         return False
     return True
+
+
+def _swiglu_gate_mode() -> str:
+    """The gate/up weight layout for the clamped-SwiGLU MXFP4 path.
+
+    Shared by the fused and stage-by-stage paths deliberately: they read the same
+    packed weights, so a disagreement is a silent layout mismatch rather than an
+    error. Imported lazily because models that never take this path
+    (swiglu_limit == 0) must keep running on aiter builds where the module lives
+    elsewhere or is absent.
+
+    Default (INTERLEAVE) preserves the pre-fix behavior for paths that prepare
+    weights in the gate/up-interleaved layout. `SGLANG_USE_AITER_MOE_GU_ITLV=0`
+    selects SEPARATED, which matches the layout produced by `Mxfp4MoEMethod`
+    (gpt-oss MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
+    """
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    from sglang.srt.environ import envs
+
+    return (
+        GateMode.INTERLEAVE.value
+        if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+        else GateMode.SEPARATED.value
+    )
+
+
+@functools.cache
+def _aiter_fused_router_supports_swiglu_limit() -> bool:
+    """Probe whether the installed `fused_moe_router` accepts `swiglu_limit`.
+
+    Builds predating clamped-SwiGLU support do not reject the argument, they simply
+    never had it: forwarding is impossible and omitting it runs stage1 unclamped.
+    That is a silent numerics change rather than a slowdown, so the caller falls
+    back to the stage-by-stage path instead.
+    """
+    entry = _aiter_fused_router()
+    if entry is None:
+        return False
+    try:
+        return "swiglu_limit" in inspect.signature(entry.call).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 @functools.cache
@@ -463,22 +516,7 @@ class AiterRunnerCore(MoeRunnerCore):
             if self.config.gemm1_clamp_limit is not None:
                 extra["linear_beta"] = float(self.config.gemm1_clamp_limit)
         elif quant_info.swiglu_limit > 0:
-            # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
-            # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
-            # swiglu_limit==0) still run on aiter builds where this module
-            # lives elsewhere / is absent.
-            from aiter.ops.flydsl.moe_common import GateMode
-
-            # Default (INTERLEAVE) preserves the pre-fix behavior for paths
-            # that prepare weights in the gate/up-interleaved layout. Set
-            # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
-            # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
-            # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
-            extra["gate_mode"] = (
-                GateMode.INTERLEAVE.value
-                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-                else GateMode.SEPARATED.value
-            )
+            extra["gate_mode"] = _swiglu_gate_mode()
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
@@ -569,6 +607,26 @@ class AiterRunnerCore(MoeRunnerCore):
             num_fused_shared_experts=fr.num_fused_shared_experts,
             shared_expert_weight=fr.shared_expert_weight,
         )
+        if quant_info.swiglu_limit > 0:
+            if not _aiter_fused_router_supports_swiglu_limit():
+                # Dropping the clamp would still produce a tensor, just the wrong
+                # one, so fall back rather than forward a partial call.
+                _census("fallback: entry cannot take swiglu_limit", tokens)
+                return None
+            try:
+                gate_mode = _swiglu_gate_mode()
+            except ImportError:
+                _census("fallback: GateMode unavailable", tokens)
+                return None
+            # Both are forwarded, not just the limit. The entry defaults
+            # gate_mode to SEPARATED while the stage-by-stage path defaults to
+            # INTERLEAVE, and the two read the same packed weights -- leaving it
+            # implicit would put them on different layouts. Passing it also lets
+            # the entry's own predicate refuse INTERLEAVE (it admits SEPARATED
+            # only), so an interleaved deployment falls back here instead of
+            # reaching the entry's `q_dtype_a == fp4x2` assert mid-serve.
+            kwargs["gate_mode"] = gate_mode
+            kwargs["swiglu_limit"] = quant_info.swiglu_limit
         # `supported` takes a narrower surface than the call itself, and a future build
         # may narrow or widen it again, so pass only what its signature names rather
         # than the call's whole kwargs. Getting this wrong is silent: it raises
