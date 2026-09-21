@@ -14,6 +14,7 @@ from sglang.kernels.ops.memory.common import (
     get_last_loc_triton_safe_i32,
     write_req_to_token_pool_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
@@ -43,6 +44,10 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+# Frozen for the process lifetime, like the platform probes above: an env
+# var cannot change after import, and alloc_for_decode is on the per-step
+# decode path where a descriptor read per call would itself be overhead.
+_use_fused_decode_alloc = envs.SGLANG_OPT_USE_FUSED_DECODE_ALLOC.get()
 
 if _is_cpu:
     from sgl_kernel import assign_req_to_token_pool_cpu
@@ -622,11 +627,16 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         # Requiring Triton here is not a new constraint: this same branch
         # already launches the Triton `alloc_decode_kernel` via
         # `alloc_paged_token_slots_decode` a few lines below.
-        last_loc = get_last_loc_triton_safe_i32(
-            batch.req_to_token_pool.req_to_token,
-            batch.req_pool_indices,
-            seq_lens_gpu,
-        )
+        if _use_fused_decode_alloc:
+            last_loc = get_last_loc_triton_safe_i32(
+                batch.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                seq_lens_gpu,
+            )
+        else:
+            last_loc = batch.req_to_token_pool.req_to_token[
+                batch.req_pool_indices, seq_lens_gpu - 1
+            ]
         seq_lens_next = seq_lens_gpu + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
@@ -642,14 +652,15 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + seq_lens_gpu
     else:
-        # Deliberately NOT a clone. `write` is an `index_put_`, which only ever
+        # With the fusion enabled, deliberately NOT a clone. `write` is an
+        # `index_put_`, which only ever
         # READS its index tensor, and ScheduleBatch never mutates seq_lens in
         # place -- every update rebinds a fresh tensor (see prepare_for_decode,
         # filter_batch and merge_batch in managers/schedule_batch.py, whose
         # out-of-place `self.seq_lens = self.seq_lens + 1` is itself documented
         # as avoiding races with overlap-queued refs). Aliasing is therefore
         # safe and saves one [bs] copy_ launch on every decode step.
-        locs = seq_lens_gpu
+        locs = seq_lens_gpu if _use_fused_decode_alloc else seq_lens_gpu.clone()
 
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
@@ -667,7 +678,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     # token_per_req, and for the page_size == 1 branch that never builds the
     # tensor, makes that consumer fall back to its own add instead of silently
     # adopting a wrong sequence length -- which would corrupt attention.
-    batch.seq_lens_next = seq_lens_next if token_per_req == 1 else None
+    batch.seq_lens_next = (
+        seq_lens_next
+        if _use_fused_decode_alloc and token_per_req == 1
+        else None
+    )
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:

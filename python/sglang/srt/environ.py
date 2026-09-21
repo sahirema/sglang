@@ -569,6 +569,15 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # Cut three per-step kernel launches out of the paged decode allocation
+    # path (mem_cache/allocation.py alloc_for_decode): a fused Triton
+    # last_loc gather replacing sub+advanced-index, dropping the defensive
+    # clone of seq_lens before the req_to_token write, and handing the
+    # already-materialised `seq_lens + 1` to prepare_for_decode instead of
+    # recomputing it. Decode at small batch is bound by launch count, not
+    # arithmetic. Off by default so the arm and its control are the same
+    # image differing only by this variable.
+    SGLANG_OPT_USE_FUSED_DECODE_ALLOC = EnvBool(False)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
