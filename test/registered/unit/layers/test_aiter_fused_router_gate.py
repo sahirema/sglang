@@ -290,5 +290,67 @@ class TestBypassedRunnerInput(CustomTestCase):
         self.assertEqual(fr.topk + fr.num_fused_shared_experts, cfg.top_k)
 
 
+class TestAiterFusedRouterPolicyGate(CustomTestCase):
+    """`SGLANG_ENABLE_AITER_FUSED_ROUTER` must be able to refuse a capable build.
+
+    The measurement depends on this: with no policy gate the only negative control is
+    an image carrying a different aiter, and that version bump confounds the result.
+    So "off" has to mean None even when every capability probe would have said yes --
+    which is why the flag-on case below is run through the identical fake, as a
+    positive control. Without it, a None could just as well be the ImportError path.
+    """
+
+    def _with_a_capable_aiter(self):
+        """Install a fake `aiter.fused_moe` carrying the whole fused-router surface."""
+        import sys
+        from types import ModuleType, SimpleNamespace
+
+        pkg = ModuleType("aiter")
+        mod = ModuleType("aiter.fused_moe")
+        mod.FUSED_MOE_ROUTER_HIDDEN_DIMS = (4096, 6144)
+        mod.FUSED_MOE_ROUTER_MAX_TOPK = 64
+        mod.FUSED_MOE_ROUTER_MAX_EXPERTS = 512
+        mod.FUSED_MOE_ROUTER_MAX_TOKENS = 512
+        mod.fused_moe_router = lambda *a, **k: None
+        mod.fused_moe_router_supported = lambda *a, **k: True
+        mod.fused_moe_router_config_supported = lambda *a, **k: True
+        mod.fused_moe_router_arch_supported = lambda: True
+        pkg.fused_moe = mod
+        return mock.patch.dict(
+            sys.modules, {"aiter": pkg, "aiter.fused_moe": mod}
+        ), SimpleNamespace()
+
+    def _probe(self, enabled: bool):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.moe_runner import aiter as aiter_runner
+
+        patcher, _ = self._with_a_capable_aiter()
+        with patcher, envs.SGLANG_ENABLE_AITER_FUSED_ROUTER.override(enabled):
+            # The probe is functools.cache'd, so the flag is latched at first call.
+            # Clear on the way in and out so neither case can see the other's answer.
+            aiter_runner._aiter_fused_router.cache_clear()
+            try:
+                return aiter_runner._aiter_fused_router()
+            finally:
+                aiter_runner._aiter_fused_router.cache_clear()
+
+    def test_disabled_refuses_a_build_that_carries_the_kernel(self):
+        self.assertIsNone(self._probe(enabled=False))
+
+    def test_enabled_accepts_the_same_build(self):
+        """Positive control for the test above, through the identical fake."""
+        entry = self._probe(enabled=True)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.hidden_dims, (4096, 6144))
+        self.assertEqual(entry.max_tokens, 512)
+
+    def test_default_is_off(self):
+        """Production default: a build carrying the kernel still does not use it."""
+        from sglang.srt.environ import envs
+
+        envs.SGLANG_ENABLE_AITER_FUSED_ROUTER.clear()
+        self.assertFalse(envs.SGLANG_ENABLE_AITER_FUSED_ROUTER.get())
+
+
 if __name__ == "__main__":
     unittest.main()

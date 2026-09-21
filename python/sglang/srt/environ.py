@@ -869,6 +869,12 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # Route the ROCm MoE routing preamble through aiter's fused entry when the
+    # installed aiter carries it. Off by default: the fused path changes numerics
+    # and has not been validated on hardware. Keeping it behind a flag also lets a
+    # single image serve as both arm and control when measuring the fusion, so the
+    # measurement is not confounded by the aiter version bump that ships it.
+    SGLANG_ENABLE_AITER_FUSED_ROUTER = EnvBool(False)
     # Assert, once per layer, that the aiter fused routing preamble produces the same
     # MoE output as the stage-by-stage chain before trusting any measurement of it.
     # Runs both paths, so it is for gating and debugging, not for serving.

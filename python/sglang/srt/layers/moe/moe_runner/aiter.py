@@ -189,8 +189,21 @@ def _aiter_fused_router() -> Optional[_FusedRouterEntry]:
     ROCm/aiter#5150 folds the router's score/top-k/slot/sort/quantize chain into one
     kernel. Most builds do not carry it, so every use here is feature-detected: absent
     or inapplicable, the caller takes the ordinary stage-by-stage path. The detection is
-    the only gate -- there is no model-name dispatch and no environment threshold.
+    the only *capability* gate -- there is no model-name dispatch and no environment
+    threshold. `SGLANG_ENABLE_AITER_FUSED_ROUTER` sits in front of it as a policy gate,
+    so the fusion can be turned off on a build that carries it. That is what lets one
+    image supply both the arm and its negative control when the fusion is measured:
+    otherwise the only available control is an image with a different aiter, and the
+    version bump confounds the result.
+
+    Returning None disables every downstream use, including the coarse capture-time
+    check, so the decision is static before CUDA-graph capture. `functools.cache`
+    latches the flag at the first call, which happens during warmup.
     """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_ENABLE_AITER_FUSED_ROUTER.get():
+        return None
     try:
         from aiter.fused_moe import (
             FUSED_MOE_ROUTER_HIDDEN_DIMS,
