@@ -1659,6 +1659,14 @@ class Envs:
     # Output is bit-identical and it is a strict LOWER bound on a proper
     # K-only kernel. Do not enable in production.
     SGLANG_OPT_INDEX_K_STORE_CACHE = EnvBool(False)
+    # MiniMax-M3 sparse decode: run qk-norm + rope + the fp8 K/V and
+    # index-K cache stores as ONE aiter launch
+    # (aiter.ops.fused_qknorm_idxrqknorm) instead of the split norm/rope +
+    # div_/cast/store chain. Off by default: the kernel hardcodes Gemma
+    # norm, NEOX split-half rope and head_dim 128, and it returns RAW k/v/
+    # index-k (cache-insert mode writes only the q lanes back), so the path
+    # is decode-only and A/B-gated rather than autodetected.
+    SGLANG_OPT_USE_MINIMAX_AITER_FUSED_QKNORM_STORE = EnvBool(False)
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
