@@ -195,9 +195,16 @@ class TestSparseFp8KvStoreGating(unittest.TestCase):
         self.assertFalse(self._accepts(pool, layer, self._src(), self._src()))
 
     def test_quantized_pool_rejected(self):
+        # `is_quantized_kv_cache` is a read-only property derived from
+        # `quant_method` (memory_pool.py:2146), so set the attribute it reads
+        # rather than the property -- assigning the property raises
+        # AttributeError and the gate is never reached. Any object that is not
+        # an UnquantizedKVCacheMethod makes it True; the assert below pins that
+        # so the case cannot start passing for the wrong reason.
         pool = _make_pool(dtype=torch.float8_e4m3fn)
         layer = _StubLayer(SPARSE_KV_LAYER_ID)
-        pool.main_pool.is_quantized_kv_cache = True
+        pool.main_pool.quant_method = object()
+        self.assertTrue(pool.main_pool.is_quantized_kv_cache)
         self.assertFalse(self._accepts(pool, layer, self._src(), self._src()))
 
 
