@@ -189,3 +189,87 @@ def get_last_loc_triton(
         BLOCK_SIZE,
     )
     return result
+
+
+@triton.jit
+def _write_decode_req_to_token_kernel(
+    req_to_token_ptr,  # [max_batch, max_context_len], int32
+    req_pool_indices_ptr,  # [bs]
+    locs_ptr,  # [bs]
+    out_cache_loc_ptr,  # [bs]
+    bs,
+    req_to_token_ptr_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offset = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
+    mask = offset < bs
+
+    req_pool_index = tl.load(req_pool_indices_ptr + offset, mask=mask, other=0)
+    loc = tl.load(locs_ptr + offset, mask=mask, other=0)
+    value = tl.load(out_cache_loc_ptr + offset, mask=mask, other=0)
+
+    # Index arithmetic in int64: max_batch * max_context_len is within int32
+    # for today's pools but not by a comfortable margin, and the row stride is
+    # attacker-independent config, so widening here costs nothing measurable.
+    token_index = req_pool_index.to(tl.int64) * req_to_token_ptr_stride + loc.to(
+        tl.int64
+    )
+    # The cast is the point: narrowing here is what replaces the caller's
+    # separate `out_cache_loc.to(torch.int32)` launch. Storing an explicitly
+    # narrowed value keeps the store same-width rather than relying on Triton's
+    # implicit conversion to the pointer dtype -- the same direction as the
+    # extend path's store above, but stated rather than inferred.
+    tl.store(req_to_token_ptr + token_index, value.to(tl.int32), mask=mask)
+
+
+def write_decode_req_to_token_triton(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    locs: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+) -> None:
+    """One-launch equivalent of the decode `req_to_token` bookkeeping write.
+
+    Replaces::
+
+        req_to_token[(req_pool_indices, locs)] = out_cache_loc.to(torch.int32)
+
+    which costs two launches -- an elementwise cast producing a throwaway [bs]
+    int32 tensor, then an `index_put_` -- with a single fused cast-and-scatter.
+    Decode issues this once per step on bs-sized tensors, where launch count
+    dominates the arithmetic entirely.
+
+    Semantics are those of `index_put_`, deliberately including its treatment of
+    padding rows: every lane is written exactly as the torch expression would
+    write it, with no filtering. Batches padded for cuda-graph replay carry
+    `req_pool_indices == 0` and rely on row 0 of `req_to_token` absorbing the
+    dummy write (see `ReqToTokenPool.__init__`, which allocates `size + 1` rows
+    for exactly this reason), so a kernel that masked those lanes out instead
+    would diverge from the torch path only on padded batches -- i.e. rarely, and
+    not deterministically. It must not.
+
+    Duplicate `(req_pool_index, loc)` pairs are not expected (each request owns
+    a distinct row) and, as with `index_put_`, resolve nondeterministically.
+    """
+    bs = req_pool_indices.shape[0]
+    # A mismatch here would silently write only the first `bs` values and
+    # corrupt the KV index table rather than raise, so it is worth a check that
+    # costs no launch and no device sync.
+    assert locs.shape[0] == bs and out_cache_loc.shape[0] == bs, (
+        f"decode req_to_token write expects [bs]-shaped operands, got "
+        f"req_pool_indices={req_pool_indices.shape}, locs={locs.shape}, "
+        f"out_cache_loc={out_cache_loc.shape}"
+    )
+
+    BLOCK_SIZE = 256
+    grid = (triton.cdiv(bs, BLOCK_SIZE),)
+    _write_decode_req_to_token_kernel[grid](
+        req_to_token,
+        req_pool_indices,
+        locs,
+        out_cache_loc,
+        bs,
+        req_to_token.stride(0),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )

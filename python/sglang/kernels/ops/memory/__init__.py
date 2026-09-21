@@ -16,6 +16,7 @@ _TRITON_KERNELS = [
     ("common", "get_last_loc_triton"),
     ("common", "get_last_loc_triton_safe"),
     ("common", "get_last_loc_triton_safe_i32"),
+    ("common", "write_decode_req_to_token_triton"),
     ("virtual_slot", "alloc_bind_inplace"),
     ("virtual_slot", "free_unbind_inplace"),
     ("virtual_slot", "bind_inplace"),
