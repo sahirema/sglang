@@ -32,6 +32,7 @@ def _glm_like_config(**overrides) -> TopKConfig:
         num_fused_shared_experts=1,
         correction_bias=torch.zeros(256),
         routed_scaling_factor=2.5,
+        apply_routed_scaling_factor_on_output=True,
         scoring_func="sigmoid",
     )
     return replace(cfg, **overrides) if overrides else cfg
@@ -55,6 +56,7 @@ class TestAiterFusedRouterGate(CustomTestCase):
         aiter_enabled=True,
         a2a="none",
         ep_size=1,
+        expert_location_dispatch_info=None,
     ):
         """Run the gate with every environmental signal it reads made explicit.
 
@@ -81,7 +83,10 @@ class TestAiterFusedRouterGate(CustomTestCase):
             moe_utils, "get_moe_a2a_backend", lambda: moe_utils.MoeA2ABackend(a2a)
         ):
             return aiter_runner.fused_router_can_bypass_topk(
-                cfg, hidden_dim, num_experts
+                cfg,
+                hidden_dim,
+                num_experts,
+                expert_location_dispatch_info=expert_location_dispatch_info,
             )
 
     def test_accepts_the_shape_the_kernel_serves(self):
@@ -107,12 +112,47 @@ class TestAiterFusedRouterGate(CustomTestCase):
         # Grouped biased top-k collapses to the flat form only at one group.
         self.assertFalse(self._gate(_glm_like_config(num_expert_group=8, topk_group=4)))
 
-    def test_refused_when_scaling_is_applied_on_the_output(self):
-        # The entry folds routed_scaling_factor into the weights; applying it to the
-        # output as well would scale twice.
-        self.assertFalse(
+    def test_accepted_when_the_scaling_factor_is_folded_into_the_weights(self):
+        """`apply_routed_scaling_factor_on_output` set is the eligible case, not the bad one.
+
+        The name is misleading: it makes the gate kernel fold routed_scaling_factor into
+        the top-k weights (moe_fused_gate.py:249), not scale the MoE output. The fused
+        entry folds it too, so the two agree. MiniMax-M3 sets it (minimax_m3.py:389) --
+        refusing here would make the whole bypass dead for the target model.
+        """
+        self.assertTrue(
             self._gate(_glm_like_config(apply_routed_scaling_factor_on_output=True))
         )
+
+    def test_refused_when_the_factor_is_not_folded_into_the_weights(self):
+        """Clear flag + a real factor means the fused entry would apply it twice.
+
+        `_pre_permute_bypassed_to_aiter` passes routed_scaling_factor to the entry
+        unconditionally, but with the flag clear the standard path leaves the weights
+        unscaled and the factor lands downstream instead. Scaling weights and scaling
+        the output are equivalent for a linear combine, so this is silent.
+        """
+        self.assertFalse(
+            self._gate(
+                _glm_like_config(
+                    apply_routed_scaling_factor_on_output=False,
+                    routed_scaling_factor=2.5,
+                )
+            )
+        )
+
+    def test_accepted_when_there_is_no_factor_to_double_apply(self):
+        """Positive control for the refusal above: only the factor distinguishes them."""
+        for factor in (None, 1.0):
+            with self.subTest(routed_scaling_factor=factor):
+                self.assertTrue(
+                    self._gate(
+                        _glm_like_config(
+                            apply_routed_scaling_factor_on_output=False,
+                            routed_scaling_factor=factor,
+                        )
+                    )
+                )
 
     def test_refused_for_a_custom_routing_function(self):
         self.assertFalse(
@@ -162,9 +202,7 @@ class TestAiterFusedRouterGate(CustomTestCase):
         """
         placement = object()  # any non-None ExpertLocationDispatchInfo
         self.assertFalse(
-            self._gate(
-                _glm_like_config(expert_location_dispatch_info=placement)
-            )
+            self._gate(_glm_like_config(), expert_location_dispatch_info=placement)
         )
 
     def test_refused_above_the_topk_ceiling(self):

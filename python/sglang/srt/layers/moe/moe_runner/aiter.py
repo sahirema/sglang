@@ -231,7 +231,11 @@ def _aiter_enabled() -> bool:
 
 
 def fused_router_can_bypass_topk(
-    topk_config, hidden_dim: int, num_experts: int
+    topk_config,
+    hidden_dim: int,
+    num_experts: int,
+    *,
+    expert_location_dispatch_info=None,
 ) -> bool:
     """Whether TopK may hand this MoE its router logits instead of computing top-k.
 
@@ -239,6 +243,14 @@ def fused_router_can_bypass_topk(
     answer cannot change between CUDA-graph capture and replay. The authoritative
     per-call check (`fused_moe_router_supported`) needs the tensors and runs in the
     runner, where a negative answer costs only the ordinary path via `to_standard()`.
+
+    `expert_location_dispatch_info` is a parameter rather than a field read off
+    `topk_config`: placement is a per-forward argument of `TopK.forward_cuda`, and the
+    object passed here is the same one `BypassedTopKOutput` carries, so this gate and
+    the `to_standard()` fallback decide on identical state. Passing it does not make
+    the gate dynamic -- `ExpertLocationDispatchInfo.init_new` returns None exactly when
+    `ep_dispatch_algorithm` is unset, a server arg fixed at startup, so only the tensors
+    inside it move under EPLB, never whether it is None.
     """
     entry = _aiter_fused_router()
     if entry is None:
@@ -275,7 +287,7 @@ def fused_router_can_bypass_topk(
     # pair logical-order logits with physically placed weights and silently address the
     # wrong expert's weights. This is the one failure here that produces a wrong result
     # rather than an exception.
-    if topk_config.expert_location_dispatch_info is not None:
+    if expert_location_dispatch_info is not None:
         return False
     if hidden_dim not in entry.hidden_dims or num_experts > entry.max_experts:
         return False
@@ -290,18 +302,30 @@ def fused_router_can_bypass_topk(
     if topk_config.custom_routing_function is not None:
         return False
 
-    # Deliberately NOT checked: `apply_routed_scaling_factor_on_output`.
-    # It does not mean "scale the MoE output" -- it means the gate kernel folds
-    # the factor into the weights it emits
-    # (moe_fused_gate.py: `if APPLY_SCALE: selected_vals = selected_vals *
-    # routed_scaling_factor`, where selected_vals are the top-k weights). The fused
-    # entry folds it into its own top-k weights, so the two agree and nothing is
-    # applied twice -- which is why `routed_scaling_factor` is passed through below.
+    # `apply_routed_scaling_factor_on_output` does NOT mean "scale the MoE output".
+    # It means the gate kernel folds routed_scaling_factor into the top-k weights it
+    # emits: moe_fused_gate.py:249 `if APPLY_SCALE: selected_vals = selected_vals *
+    # routed_scaling_factor`, and `selected_vals` is what is written to out_weights_ptr.
+    # `_pre_permute_bypassed_to_aiter` hands the factor to the fused entry
+    # unconditionally, so the entry always folds it. The two paths therefore agree only
+    # when the flag is set -- which MiniMax-M3 does (minimax_m3.py:389), so refusing on
+    # the flag being set would make this gate dead for the model it was written for.
     #
-    # The one model that really does scale the MoE output (bailing_moe_v3) keys that
-    # off a separate attribute, gated on `_enable_a2a_moe and not
+    # With the flag clear the standard path leaves the weights unscaled and the factor
+    # is applied downstream instead, so folding it in here would apply it twice.
+    # Scaling the weights and scaling the output are equivalent for a linear combine,
+    # so nothing raises: this is the second silent-wrong-result case in this function,
+    # alongside the placement check above. A factor of 1 (or unset) is a no-op either
+    # way and stays eligible.
+    #
+    # bailing_moe_v3 is the one model that really does scale the MoE output. It keys
+    # that off a separate attribute gated on `_enable_a2a_moe and not
     # should_fuse_routed_scaling_factor_in_topk` -- mutually exclusive with this flag,
     # and in an a2a mode the check above already refuses.
+    if not topk_config.apply_routed_scaling_factor_on_output and (
+        topk_config.routed_scaling_factor not in (None, 1.0)
+    ):
+        return False
 
     if topk_config.top_k > entry.max_topk:
         return False

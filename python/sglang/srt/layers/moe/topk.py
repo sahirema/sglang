@@ -273,7 +273,11 @@ _AITER_BYPASS_LOGGED: list = []
 
 
 def _aiter_fused_router_bypass(
-    topk_config: TopKConfig, hidden_dim: int, num_experts: int
+    topk_config: TopKConfig,
+    hidden_dim: int,
+    num_experts: int,
+    *,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> bool:
     """Whether the installed aiter can route this MoE itself, so top-k is skipped here.
 
@@ -284,7 +288,12 @@ def _aiter_fused_router_bypass(
         from sglang.srt.layers.moe.moe_runner.aiter import fused_router_can_bypass_topk
     except ImportError:
         return False
-    decision = fused_router_can_bypass_topk(topk_config, hidden_dim, num_experts)
+    decision = fused_router_can_bypass_topk(
+        topk_config,
+        hidden_dim,
+        num_experts,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+    )
     if not _AITER_BYPASS_LOGGED:
         _AITER_BYPASS_LOGGED.append(decision)
         logger.info(
@@ -684,7 +693,10 @@ class TopK(BaseFusedOp):
         ):
             output_format = TopKOutputFormat.BYPASSED
         elif _aiter_fused_router_bypass(
-            self.topk_config, hidden_states.shape[-1], router_logits.shape[-1]
+            self.topk_config,
+            hidden_states.shape[-1],
+            router_logits.shape[-1],
+            expert_location_dispatch_info=expert_location_dispatch_info,
         ):
             # The aiter build carries a fused routing preamble that does the selection
             # itself, so computing it here would be paid twice. The runner falls back
