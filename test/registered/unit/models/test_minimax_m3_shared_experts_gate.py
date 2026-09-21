@@ -2,6 +2,7 @@ import types
 import unittest
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
 from sglang.srt.models import minimax_m3, minimax_m3_vl
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -16,6 +17,7 @@ _GATES = {
     "vl": minimax_m3_vl.MiniMaxM3SparseForConditionalGeneration,
 }
 _MODULES = {"text": minimax_m3, "vl": minimax_m3_vl}
+_ROCM_OPT_IN = envs.SGLANG_OPT_USE_MINIMAX_ROCM_SHARED_EXPERTS_FUSION
 
 
 def _hf_config(kind, *, n_shared_experts=1):
@@ -32,9 +34,23 @@ class TestSharedExpertsFusionDisableReason(CustomTestCase):
     architecture string the config names -- no error, just a different model.
     """
 
-    def _reason(self, kind, *, is_cuda, is_hip, gfx95, device_sm, ep_size=1, quant=None):
+    def _reason(
+        self,
+        kind,
+        *,
+        is_cuda,
+        is_hip,
+        gfx95,
+        device_sm,
+        ep_size=1,
+        quant=None,
+        rocm_opt_in=True,
+    ):
+        # The ROCm path is opt-in behind an env flag; default it to on here
+        # so these cases keep testing the platform checks themselves.
         mod = _MODULES[kind]
         with (
+            _ROCM_OPT_IN.override(rocm_opt_in),
             patch.object(mod, "_is_cuda", is_cuda),
             patch.object(mod, "_is_hip", is_hip),
             patch.object(mod, "_is_gfx95_supported", gfx95),
@@ -67,6 +83,27 @@ class TestSharedExpertsFusionDisableReason(CustomTestCase):
         # _device_sm is not None on ROCm; the SM80 check must not reject it.
         self.assertIsNone(
             self._both(is_cuda=False, is_hip=True, gfx95=True, device_sm=0)
+        )
+
+    def test_rocm_requires_opt_in(self):
+        # Default off: gfx950 alone must not enable fusion, otherwise an A/B
+        # control on this image would already carry the arm.
+        reason = self._both(
+            is_cuda=False, is_hip=True, gfx95=True, device_sm=0, rocm_opt_in=False
+        )
+        self.assertIsNotNone(reason)
+        self.assertIn("SGLANG_OPT_USE_MINIMAX_ROCM_SHARED_EXPERTS_FUSION", reason)
+
+    def test_cuda_unaffected_by_rocm_opt_in(self):
+        # The flag is ROCm-only; CUDA must behave identically either way.
+        self.assertIsNone(
+            self._both(
+                is_cuda=True,
+                is_hip=False,
+                gfx95=False,
+                device_sm=90,
+                rocm_opt_in=False,
+            )
         )
 
     def test_rocm_below_gfx95_is_rejected(self):

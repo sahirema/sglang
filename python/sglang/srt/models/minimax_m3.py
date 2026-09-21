@@ -1614,6 +1614,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             )
         if not (_is_cuda or _is_hip):
             return "Shared experts fusion currently requires CUDA or ROCm devices."
+        if _is_hip and not envs.SGLANG_OPT_USE_MINIMAX_ROCM_SHARED_EXPERTS_FUSION.get():
+            return (
+                "Shared experts fusion on ROCm is opt-in; set "
+                "SGLANG_OPT_USE_MINIMAX_ROCM_SHARED_EXPERTS_FUSION=1 to enable."
+            )
         if _is_hip and not _is_gfx95_supported:
             return "Shared experts fusion on ROCm is validated on gfx950 only."
         if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
