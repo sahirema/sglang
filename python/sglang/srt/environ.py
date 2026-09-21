@@ -1647,6 +1647,14 @@ class Envs:
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
+    # MiniMax-M3 sparse decode: run qk-norm + rope + the fp8 K/V and
+    # index-K cache stores as ONE aiter launch
+    # (aiter.ops.fused_qknorm_idxrqknorm) instead of the split norm/rope +
+    # div_/cast/store chain. Off by default: the kernel hardcodes Gemma
+    # norm, NEOX split-half rope and head_dim 128, and it returns RAW k/v/
+    # index-k (cache-insert mode writes only the q lanes back), so the path
+    # is decode-only and A/B-gated rather than autodetected.
+    SGLANG_OPT_USE_MINIMAX_AITER_FUSED_QKNORM_STORE = EnvBool(False)
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)

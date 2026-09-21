@@ -864,11 +864,16 @@ class MiniMaxM3Attention(nn.Module):
             and self.index_rotary_emb is self.rotary_emb
         )
 
-        # Model-geometry half of the aiter fused-store gate. Each condition
-        # names the kernel requirement it satisfies; the per-call half lives in
-        # _aiter_fused_store_runtime_reason / _aiter_fused_store_cache_views.
+        # Opt-in flag plus the model-geometry half of the aiter fused-store
+        # gate. Each condition names the kernel requirement it satisfies; the
+        # per-call half lives in _aiter_fused_store_runtime_reason /
+        # _aiter_fused_store_cache_views.
         self._aiter_fused_store_static_ok = (
-            _aiter_fused_qknorm_idxrqknorm is not None
+            # Default off, so an unflagged process runs the pre-existing
+            # route: control and arm are then the same image differing only
+            # by this env var.
+            envs.SGLANG_OPT_USE_MINIMAX_AITER_FUSED_QKNORM_STORE.get()
+            and _aiter_fused_qknorm_idxrqknorm is not None
             and self.is_sparse_attention_layer
             # The kernel's row layout is exactly [q|k|v|idx_q|idx_k]. An idx_v
             # column would shift index-k off its (nq + 2*nkv + niq) slot.
