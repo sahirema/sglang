@@ -59,7 +59,7 @@ from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
-_EMBEDDING_UNSUPPORTED_DATASETS = {"image", "video", "mmmu", "mooncake"}
+_EMBEDDING_UNSUPPORTED_DATASETS = {"image", "video", "audio", "mmmu", "mooncake"}
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
@@ -100,6 +100,7 @@ class RequestFuncInput:
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
     video_data: Optional[List[str]] = None
+    audio_data: Optional[List[str]] = None
 
 
 @dataclass
@@ -441,21 +442,35 @@ async def async_request_openai_chat_completions(
 
     if isinstance(request_func_input.prompt, list):
         messages = request_func_input.prompt
-    elif request_func_input.image_data or request_func_input.video_data:
-        # Build multimodal content: image/video entries followed by the text
-        content_items = [
-            {
-                "type": "image_url",
-                "image_url": {"url": img_url},
-            }
-            for img_url in request_func_input.image_data or []
-        ] + [
-            {
-                "type": "video_url",
-                "video_url": {"url": vid_url},
-            }
-            for vid_url in request_func_input.video_data or []
-        ]
+    elif (
+        request_func_input.image_data
+        or request_func_input.video_data
+        or request_func_input.audio_data
+    ):
+        # Build multimodal content: image/video/audio entries followed by the text
+        content_items = (
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": img_url},
+                }
+                for img_url in request_func_input.image_data or []
+            ]
+            + [
+                {
+                    "type": "video_url",
+                    "video_url": {"url": vid_url},
+                }
+                for vid_url in request_func_input.video_data or []
+            ]
+            + [
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": audio_url},
+                }
+                for audio_url in request_func_input.audio_data or []
+            ]
+        )
         content_items.append({"type": "text", "text": request_func_input.prompt})
         messages = [
             {
@@ -726,11 +741,13 @@ async def async_request_sglang_generate(
         if args.token_ids_logprob is not None:
             payload["token_ids_logprob"] = args.token_ids_logprob
 
-        # Add image/video data if available (list of urls/base64)
+        # Add image/video/audio data if available (list of urls/base64)
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
         if request_func_input.video_data:
             payload["video_data"] = request_func_input.video_data
+        if request_func_input.audio_data:
+            payload["audio_data"] = request_func_input.audio_data
 
         headers = get_request_headers()
         if request_func_input.routing_key:
@@ -1491,6 +1508,7 @@ async def benchmark(
         lora_name=lora_name,
         image_data=test_request.image_data,
         video_data=test_request.video_data,
+        audio_data=test_request.audio_data,
         extra_request_body=extra_request_body,
     )
 
@@ -1617,6 +1635,7 @@ async def benchmark(
             lora_name=lora_name,
             image_data=request.image_data,
             video_data=request.video_data,
+            audio_data=request.audio_data,
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
@@ -2166,7 +2185,7 @@ def run_benchmark(args_: argparse.Namespace):
         print(f"{args.dataset_name} dataset is unsupported for embeddings benchmark")
         sys.exit(1)
 
-    if args.dataset_name in ["image", "video", "mmmu"]:
+    if args.dataset_name in ["image", "video", "audio", "mmmu"]:
         args.apply_chat_template = True
         assert not args.tokenize_prompt, (
             f"`--tokenize-prompt` not compatible with {args.dataset_name} dataset"
@@ -2356,6 +2375,7 @@ def cli_main():
             "mmmu",
             "image",
             "video",
+            "audio",
             "mooncake",
             "longbench_v2",
             "speed-bench",
@@ -2430,20 +2450,20 @@ def cli_main():
         "--random-input-len",
         type=int,
         default=1024,
-        help="Number of input tokens per request, used only for random and image dataset.",
+        help="Number of input tokens per request, used only for random, image, video, and audio datasets.",
     )
     parser.add_argument(
         "--random-output-len",
         default=1024,
         type=int,
-        help="Number of output tokens per request, used only for random and image dataset.",
+        help="Number of output tokens per request, used only for random, image, video, and audio datasets.",
     )
     parser.add_argument(
         "--random-range-ratio",
         type=float,
         default=0.0,
         help="Range of sampled ratio of input/output length, "
-        "used only for random, image, and video datasets.",
+        "used only for random, image, video, and audio datasets.",
     )
     # image dataset args
     parser.add_argument(
@@ -2517,6 +2537,36 @@ def cli_main():
         type=str,
         default="mp4",
         help=("Container format for videos for video dataset."),
+    )
+    # audio dataset args
+    parser.add_argument(
+        "--audio-count",
+        type=int,
+        default=1,
+        help="Number of audio clips per request (only available with the audio dataset)",
+    )
+    parser.add_argument(
+        "--audio-duration",
+        type=float,
+        default=5.0,
+        help="Duration in seconds of each synthetic audio clip (only available with the audio dataset)",
+    )
+    parser.add_argument(
+        "--audio-channels",
+        type=int,
+        default=1,
+        help="Number of channels per synthetic audio clip (1=mono, 2=stereo)",
+    )
+    parser.add_argument(
+        "--random-audio-count",
+        action="store_true",
+        help="Enable Random Audio Count",
+    )
+    parser.add_argument(
+        "--audio-format",
+        type=str,
+        default="wav",
+        help=("Encoding format for audio dataset. Supports wav."),
     )
     parser.add_argument(
         "--request-rate",
