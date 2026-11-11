@@ -105,7 +105,16 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
                 # to undo (or, worse, silently misread as already having its
                 # own layout). Mirrors fp8.py's own keep_plain_weight_layout,
                 # set by DeepSeek-V4's wo_a for its absorb GEMM.
-                layer.weight = Parameter(weight, requires_grad=False)
+                #
+                # weight is still a ModelWeightParameter here (every other
+                # branch below strips it incidentally via .to()/.t()/
+                # shuffle_weight() before wrapping in Parameter(); this is the
+                # only branch that doesn't transform it at all) -- Parameter()
+                # requires detach() to return the same type, which the base
+                # class doesn't override, so wrapping the raw subclass raises.
+                # .data strips it the same way weight_scale already is, two
+                # lines above.
+                layer.weight = Parameter(weight.data, requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             else:
                 if _is_hip and weight.shape[0] % 16 != 0:
