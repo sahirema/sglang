@@ -122,6 +122,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_platform,
+    get_server_args,
     get_stream,
 )
 from sglang.srt.utils import (
@@ -863,6 +864,18 @@ class MiniMaxM3Attention(nn.Module):
                     parallel_group=index_parallel_group,
                 )
             self.index_rotary_emb = self.rotary_emb
+
+            if get_server_args().enable_amd_monokernel:
+                # sgl_amd_mono reads these projections' own weight / weight_scale
+                # directly (reshuffling an already-FP8 Quark export as-is, or
+                # quantizing fresh from bf16) rather than through apply_weights,
+                # so the quant scheme's own layout transform (transpose, aiter
+                # bpreshuffle) must not run on them first -- it would hand the
+                # monokernel a tensor already in the wrong shape for its own
+                # (16, 16) reshuffle. Plain (non-monokernel) serving of these
+                # same projections is unaffected: the flag is only ever set here.
+                for proj in (self.qkv_proj, self.o_proj, self.index_qkv_proj):
+                    proj.keep_plain_weight_layout = True
 
         if self.qk_norm_type == "per_layer":
             if attn_tp_size > 1:

@@ -97,31 +97,42 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
             else:
                 weight_scale = layer.weight_scale.data
-            if _is_hip and weight.shape[0] % 16 != 0:
-                # hipBLASLt needs the GEMM's N to be a multiple of 16 and
-                # torch._scaled_mm raises instead of padding. A narrow output
-                # partition cannot satisfy that at any batch size (Kimi-K3's KDA
-                # b_proj emits one beta channel per head, 12 at TP=8), so serve
-                # this linear dequantized; at that width it is memory-bound.
-                layer.weight = Parameter(
-                    (weight.to(torch.float32) * weight_scale.view(-1, 1))
-                    .to(self.out_dtype)
-                    .t(),
-                    requires_grad=False,
-                )
-                layer.weight_scale = None
-                layer.input_scale = None
-                return
-            if self.per_token:
-                weight_scale = weight_scale.view(-1, 1)
-            if use_aiter_bpreshuffle_gemm(weight.shape[0]):
-                layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)).t(), requires_grad=False
-                )
+            if getattr(layer, "keep_plain_weight_layout", False):
+                # A custom kernel (e.g. sgl-project/sgl-amd-mono) reads this
+                # Linear's own weight / weight_scale directly, in the plain
+                # layout the checkpoint declared -- not the (16, 16) aiter
+                # bpreshuffle or the transpose below, which it would then have
+                # to undo (or, worse, silently misread as already having its
+                # own layout). Mirrors fp8.py's own keep_plain_weight_layout,
+                # set by DeepSeek-V4's wo_a for its absorb GEMM.
+                layer.weight = Parameter(weight, requires_grad=False)
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             else:
-                layer.weight = Parameter(weight.t(), requires_grad=False)
-            # required by torch.compile to be torch.nn.Parameter
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                if _is_hip and weight.shape[0] % 16 != 0:
+                    # hipBLASLt needs the GEMM's N to be a multiple of 16 and
+                    # torch._scaled_mm raises instead of padding. A narrow output
+                    # partition cannot satisfy that at any batch size (Kimi-K3's
+                    # KDA b_proj emits one beta channel per head, 12 at TP=8), so
+                    # serve this linear dequantized; at that width it is memory-bound.
+                    layer.weight = Parameter(
+                        (weight.to(torch.float32) * weight_scale.view(-1, 1))
+                        .to(self.out_dtype)
+                        .t(),
+                        requires_grad=False,
+                    )
+                    layer.weight_scale = None
+                    layer.input_scale = None
+                    return
+                if self.per_token:
+                    weight_scale = weight_scale.view(-1, 1)
+                if use_aiter_bpreshuffle_gemm(weight.shape[0]):
+                    layer.weight = Parameter(
+                        shuffle_weight(weight, (16, 16)).t(), requires_grad=False
+                    )
+                else:
+                    layer.weight = Parameter(weight.t(), requires_grad=False)
+                # required by torch.compile to be torch.nn.Parameter
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
         else:
             raise ValueError(f"Unknown quantization scheme {self.weight_qscheme}")
