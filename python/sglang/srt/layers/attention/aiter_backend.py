@@ -1668,13 +1668,24 @@ class AiterAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         max_kv_len: int,
+        page_size: Optional[int] = None,
     ):
         """Build the 2D block page_table (+ SWA translation) that
         unified_attention needs for a plain extend/prefill batch. Mirrors the
         target_verify builder with draft_num=0; rows are sized to the batch's own
-        longest sequence since extend is never graph-captured."""
+        longest sequence since extend is never graph-captured.
+
+        page_size defaults to self.page_size but can be overridden to build a
+        table at a FINER virtual granularity than the server's real page_size --
+        req_to_token stores raw, page-agnostic pool-slot indices (see
+        scatter_req_to_token_to_page_table_kernel: block_vals = vals // PAGE_SIZE),
+        so dividing by any divisor of the real page_size still yields a correct
+        page table into the same flat pool, as long as the real allocator granularity
+        is a multiple of the requested one (true whenever self.page_size % page_size == 0).
+        """
         device = seq_lens.device
-        page_size = self.page_size
+        if page_size is None:
+            page_size = self.page_size
         max_blocks = max((max_kv_len + page_size - 1) // page_size, 1)
 
         page_table = torch.zeros(bs, max_blocks, dtype=torch.int32, device=device)
@@ -5421,6 +5432,198 @@ class AiterAttnBackend(AttentionBackend):
                     k_descale,
                     v_descale,
                 )
+
+            # EXPERIMENTAL: FlyDSL's native paged-KV varlen kernel (bf16 or fp8),
+            # for dense (non-MLA) hd128 GQA layers. FlyDSL's gfx950 DUALWAVE_SWP
+            # tile layout structurally requires BLOCK_N=64 (hardcoded into its LDS
+            # tile-stride math, not a free parameter) -- but req_to_token stores
+            # raw, page-agnostic pool-slot indices (confirmed in
+            # scatter_req_to_token_to_page_table_kernel: block_vals = vals // PAGE_SIZE),
+            # and the KV pool itself is one flat contiguous [total_slots, H, D]
+            # tensor regardless of the server's configured self.page_size. So instead
+            # of requiring the SERVER to run with page_size=64, this branch builds its
+            # own VIRTUAL 64-token-granularity page table/view into that same flat
+            # pool -- valid whenever self.page_size is a multiple of 64, which covers
+            # today's real production page_size=128 as well as 64 itself. Opt-in via
+            # env var, defaults off: the baseline path below is untouched when unset.
+            #
+            # fp8 KV cache: FlyDSL's paged kernel has a dedicated fp8 e4m3fn path
+            # (flash_attn_fp8_paged_gfx950.py) requiring per-tensor q/k/v descales,
+            # auto-selected from Q's dtype. Confirmed fp8_dtype resolves to
+            # torch.float8_e4m3fn (not e4m3fnuz) on gfx950 -- is_fp8_fnuz() in
+            # sglang's fp8_kernel.py only returns True for "gfx94" (MI300-series),
+            # not gfx950 -- so no cross-format mismatch against FlyDSL's hardcoded
+            # Float8E4M3FN. Q is quantized via the existing _quantize_q_fp8 helper
+            # (not a raw .to(fp8) cast, which NaNs on out-of-range values per that
+            # helper's own docstring); K/V stay in their native fp8 cache dtype,
+            # only reshaped/virtually-paged, never cast.
+            _FLYDSL_PAGE_SIZE = 64
+            _flydsl_is_fp8 = self.kv_cache_dtype == fp8_dtype
+            if (
+                os.environ.get("SGLANG_AITER_FLYDSL_PREFILL_HD128_PS64", "0") == "1"
+                and is_gfx95_supported()
+                and forward_batch.forward_mode.is_extend()
+                and window_size == (-1, -1)
+                and sinks is None
+                and self.logits_soft_cap == 0.0
+                and layer.qk_head_dim == layer.v_head_dim == 128
+                and self.page_size % _FLYDSL_PAGE_SIZE == 0
+                and (
+                    (q.dtype == torch.bfloat16 and not _flydsl_is_fp8)
+                    or _flydsl_is_fp8
+                )
+            ):
+                from kernels.attention.flash_attn_interface import (
+                    flydsl_flash_attn_func,
+                )
+
+                if not getattr(self, "_flydsl_prefill_hd128_ps64_logged", False):
+                    logger.warning(
+                        "[EXPERIMENTAL] FlyDSL paged %s prefill branch (hd128, "
+                        "virtual page_size=%d over real server page_size=%d) is "
+                        "ACTIVE for layer %d (logged once per backend instance)",
+                        "fp8" if _flydsl_is_fp8 else "bf16",
+                        _FLYDSL_PAGE_SIZE,
+                        self.page_size,
+                        layer.layer_id,
+                    )
+                    self._flydsl_prefill_hd128_ps64_logged = True
+
+                k_cache_fly, v_cache_fly = self.kv_layers.read(layer.layer_id).kv()
+                kv_indptr_fly = self.forward_metadata.kv_indptr[:bs0]
+                # Per-batch KV length (prefix + extend chunk), not cumulative —
+                # same derivation already used for seqused_k in the draft_extend
+                # branch above (kv_indptr diff, widened to int64 to avoid a 32-bit
+                # wrap once a per-layer KV buffer crosses 2 GiB). Paged FP8
+                # strictly requires int32 (validated inside flydsl_flash_attn_func);
+                # token counts never approach int32 range so this is always safe.
+                seqlen_k_fly = (kv_indptr_fly[1:] - kv_indptr_fly[:-1]).to(
+                    torch.int32 if _flydsl_is_fp8 else torch.int64
+                )
+                # forward_metadata.kv_indices is a flat PER-TOKEN pool-slot array
+                # (kv_indptr is a token-level cumsum here, not a page-count CSR
+                # offset -- see AiterIndicesUpdaterPrefill), not the dense 2D
+                # page-id table FlyDSL's paged kernel expects as block_table.
+                # Build the real one via the same helper _forward_extend_unified
+                # already relies on for exactly this, but forced to the VIRTUAL
+                # 64-token granularity FlyDSL needs regardless of self.page_size.
+                #
+                # This table (and, for fp8, the unique-page compaction below)
+                # depends only on batch request structure (seq_lens,
+                # req_pool_indices, max_kv_len) -- identical across all 3 dense
+                # attention layers in one forward pass, not per-layer. Cache it
+                # on self.forward_metadata (a fresh object each forward pass --
+                # see the many `self.forward_metadata = ForwardMetadata(...)`
+                # call sites -- so no cross-request staleness risk) to avoid
+                # rebuilding it 3x per forward pass via a redundant triton
+                # kernel launch (+ torch.unique for fp8).
+                _flydsl_cache = getattr(self.forward_metadata, "_flydsl_page_cache", None)
+                if _flydsl_cache is None:
+                    page_table_fly, _ = self._build_extend_unified_page_table(
+                        forward_batch.batch_size,
+                        forward_batch.seq_lens,
+                        forward_batch.req_pool_indices,
+                        self.forward_metadata.max_kv_len,
+                        page_size=_FLYDSL_PAGE_SIZE,
+                    )
+                    unique_pages = None  # computed below for fp8 only, then cached
+                else:
+                    page_table_fly, unique_pages = _flydsl_cache
+                max_q_len_fly = self.forward_metadata.max_q_len
+                if self.deterministic_prefill_max_q is not None:
+                    max_q_len_fly = max(max_q_len_fly, self.deterministic_prefill_max_q)
+                q_fly = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                q_descale_fly = k_descale_fly = v_descale_fly = None
+                flydsl_kv_cache_layout = "linear"
+                if _flydsl_is_fp8:
+                    # k_descale/v_descale are already computed at the top of
+                    # forward_extend for the fp8-KV case (layer.k_scale/v_scale
+                    # or the fallback self.k_scale/v_scale) -- reuse them as-is,
+                    # same source the existing mha_batch_prefill_func/ASM fp8
+                    # branches use. k_scale is calibrated for K, not Q, so Q gets
+                    # its own properly-calibrated static scale via _quantize_q_fp8.
+                    q_fly, q_descale_fly = self._quantize_q_fp8(q_fly)
+                    k_descale_fly = k_descale.reshape(1)
+                    v_descale_fly = v_descale.reshape(1)
+                    # FlyDSL's paged-FP8 path REQUIRES kv_cache_layout="vectorized"
+                    # for page sizes 16/64/1024 ("linear" is only valid at page
+                    # size 1) -- confirmed via NotImplementedError on first attempt,
+                    # and via FlyDSL's own test suite (_paged_fp8_cache_shapes /
+                    # _paged_fp8_torch_reference in tests/kernels/test_flash_attn_fwd.py).
+                    # Unlike the bf16 "linear" path, this is NOT a free .view(): K
+                    # needs [pages, Hkv, D/16, page_size, 16] and V needs
+                    # [pages, Hkv, page_size/16, value_head_dim, 16] -- both a real
+                    # transpose of our native [pages, page_size, Hkv, head_dim] pool
+                    # layout, derived and cross-checked against FlyDSL's own
+                    # permute(0,3,1,2,4) [K] / permute(0,2,4,1,3) [V] reference
+                    # (vectorized->natural), inverted here (natural->vectorized).
+                    #
+                    # Transform only the pages this batch actually references, not
+                    # the whole pool (same spirit as the existing fp8 ASM gather
+                    # branch above, which gathers active tokens for the same
+                    # layout-mismatch reason). torch.unique's inverse_indices
+                    # gives both the compacted page set AND the remapped
+                    # block_table in one call; including a stray page 0 from
+                    # zero-padded block_table rows is harmless (those slots are
+                    # never read -- bounded by seqlen_k/cu_seqlens at the kernel
+                    # level) so no separate padding mask is needed.
+                    _FLYDSL_KVS = 16  # 16 bytes / 1-byte fp8 element
+                    Hkv = k_cache_fly.shape[-2]
+                    k_head_dim = k_cache_fly.shape[-1]
+                    v_head_dim = v_cache_fly.shape[-1]
+                    k_pages_all = k_cache_fly.view(-1, _FLYDSL_PAGE_SIZE, Hkv, k_head_dim)
+                    v_pages_all = v_cache_fly.view(-1, _FLYDSL_PAGE_SIZE, Hkv, v_head_dim)
+                    if _flydsl_cache is None:
+                        unique_pages, remapped_flat = torch.unique(
+                            page_table_fly.reshape(-1), return_inverse=True
+                        )
+                        page_table_fly = remapped_flat.view(page_table_fly.shape).to(torch.int32)
+                    # else: page_table_fly (already remapped) and unique_pages both
+                    # come straight from the cache -- identical across all 3 dense
+                    # layers this forward pass, so no need to recompute.
+                    k_gathered = k_pages_all[unique_pages.long()]
+                    v_gathered = v_pages_all[unique_pages.long()]
+                    k_cache_fly = (
+                        k_gathered.view(
+                            -1, _FLYDSL_PAGE_SIZE, Hkv, k_head_dim // _FLYDSL_KVS, _FLYDSL_KVS
+                        )
+                        .permute(0, 2, 3, 1, 4)
+                        .contiguous()
+                    )
+                    v_cache_fly = (
+                        v_gathered.view(
+                            -1, _FLYDSL_PAGE_SIZE // _FLYDSL_KVS, _FLYDSL_KVS, Hkv, v_head_dim
+                        )
+                        .permute(0, 3, 1, 4, 2)
+                        .contiguous()
+                    )
+                    flydsl_kv_cache_layout = "vectorized"
+                else:
+                    k_cache_fly = k_cache_fly.view(-1, _FLYDSL_PAGE_SIZE, *k_cache_fly.shape[-2:])
+                    v_cache_fly = v_cache_fly.view(-1, _FLYDSL_PAGE_SIZE, *v_cache_fly.shape[-2:])
+                if _flydsl_cache is None:
+                    self.forward_metadata._flydsl_page_cache = (page_table_fly, unique_pages)
+                o = flydsl_flash_attn_func(
+                    q_fly,
+                    k_cache_fly,
+                    v_cache_fly,
+                    causal=True,
+                    num_kv_heads=layer.tp_k_head_num,
+                    cu_seqlens_q=self.forward_metadata.qo_indptr[:bs0],
+                    cu_seqlens_kv=kv_indptr_fly,
+                    max_seqlen_q=max_q_len_fly,
+                    max_seqlen_kv=self.forward_metadata.max_kv_len,
+                    cross_seqlen=True,
+                    block_table=page_table_fly,
+                    seqlen_k=seqlen_k_fly,
+                    kv_cache_layout=flydsl_kv_cache_layout,
+                    q_descale=q_descale_fly,
+                    k_descale=k_descale_fly,
+                    v_descale=v_descale_fly,
+                )
+                if o.dtype != self.input_dtype:
+                    o = o.to(self.input_dtype)
+                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
             # NHD path — original aiter paged batch_prefill.
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
