@@ -57,6 +57,35 @@ _reduced: Optional[Tuple[int, int]] = None
 # (data_ptr, numel, slice) of the last reduce-scatter-only o_proj output: the
 # full-shaped placeholder o_proj returned, and this rank's reduced rows.
 _scattered: Optional[Tuple[int, int, torch.Tensor]] = None
+# mori's op always runs on `torch.cuda.current_stream()` (no stream param on
+# its __call__); without this, every fused call runs on the same stream as
+# the rest of the forward pass and queues behind unrelated kernels (e.g.
+# other sequences' decode steps) that have nothing to do with producing its
+# input, not just the GEMM that does.
+_comm_stream: Optional[torch.cuda.Stream] = None
+
+
+def _comm_stream_for(device: torch.device) -> torch.cuda.Stream:
+    global _comm_stream
+    if _comm_stream is None:
+        _comm_stream = torch.cuda.Stream(device=device)
+    return _comm_stream
+
+
+def _run_on_comm_stream(x_in: torch.Tensor, call):
+    """Run `call` on the dedicated comm stream, synchronized against `x_in`'s
+    producer on entry and against the caller's stream on exit."""
+    current = torch.cuda.current_stream()
+    comm_stream = _comm_stream_for(x_in.device)
+    comm_stream.wait_stream(current)
+    with torch.cuda.stream(comm_stream):
+        out = call()
+    current.wait_stream(comm_stream)
+    # x_in was produced on `current`, not `comm_stream`; without this the
+    # caching allocator could reclaim its memory before comm_stream's read
+    # of it actually runs.
+    x_in.record_stream(comm_stream)
+    return out
 
 
 def enabled() -> bool:
@@ -366,7 +395,9 @@ class _FusedApply:
             else:
                 v[:, :per].copy_(x.view(ws, per, k))
                 v[:, per:].zero_()
-        reduced = op.reduce_scatter(x_in, weight, logical_m=m_pad)
+        reduced = _run_on_comm_stream(
+            x_in, lambda: op.reduce_scatter(x_in, weight, logical_m=m_pad)
+        )
         my_rows = per + (1 if op.rank < extra else 0)
         full = reduced._base
         if full is None:
@@ -415,4 +446,5 @@ def _fused(op, weight, x) -> Optional[torch.Tensor]:
     if m_pad > op.m_max or m < _MIN_PAD_FILL * m_pad:
         return None
     x_in = x if m_pad == m else op.pad_rows(x, m_pad)
-    return op(x_in, weight, logical_m=m)[:m]
+    out = _run_on_comm_stream(x_in, lambda: op(x_in, weight, logical_m=m))
+    return out[:m]
